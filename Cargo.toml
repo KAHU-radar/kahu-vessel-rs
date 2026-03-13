@@ -1,0 +1,61 @@
+[package]
+name = "kahu-daemon"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80.0"
+description = "KAHU vessel daemon: ingests raw mayara radar spokes, tracks targets, uploads to TrackServer"
+
+[[bin]]
+name = "kahu-daemon"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime — same choice as mayara
+tokio = { version = "1", features = ["full"] }
+
+# WebSocket client — connects to mayara ws://localhost:6502/v2/api/radars/<id>/spokes
+# Each WS binary message is exactly one RadarMessage protobuf (no framing needed)
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = "0.3"
+
+# Protobuf — same version as mayara so we share RadarMessage type definitions
+protobuf = "3.5.1"
+
+# Avro encoding for TrackServer :9900 upload
+apache-avro = { version = "0.17", features = ["snappy"] }
+
+# SQLite offline buffer
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# Kalman filter / linear algebra — same as mayara
+nalgebra = { version = "0.33", features = ["std"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# CLI flags
+clap = { version = "4", features = ["derive", "env"] }
+
+# Config file (TOML — matches kahu-vessel pattern)
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# UUID generation for track IDs
+uuid = { version = "1", features = ["v4"] }
+
+# Timestamps
+chrono = { version = "0.4", features = ["serde"] }
+
+[build-dependencies]
+# Generates Rust types from RadarMessage.proto at compile time
+protobuf-codegen = "3.5.1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

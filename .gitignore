@@ -1,0 +1,5 @@
+/target
+CLAUDE.md
+.DS_Store
+config.toml
+.env
