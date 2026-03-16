@@ -15,7 +15,7 @@ tokio = { version = "1", features = ["full"] }
 
 # WebSocket client — connects to mayara ws://localhost:6502/v2/api/radars/<id>/spokes
 # Each WS binary message is exactly one RadarMessage protobuf (no framing needed)
-tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 futures-util = "0.3"
 
 # Protobuf — same version as mayara so we share RadarMessage type definitions
