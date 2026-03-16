@@ -1,80 +1,99 @@
 mod protos;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use futures_util::StreamExt;
 use protobuf::Message;
+use tokio::time::{sleep, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 
-// Generated struct lives at protos::RadarMessage::RadarMessage
-// (protobuf-codegen creates a module named after the .proto file,
-//  containing the struct of the same name)
 use protos::RadarMessage::RadarMessage;
+
+// How long to wait before retrying a failed connection.
+const RETRY_DELAY: Duration = Duration::from_secs(3);
 
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::init();
 
-    // TODO: read from config file; hard-code for initial bring-up
-    // Radar ID comes from mayara's detected radar key (e.g. "nav1034A").
+    // TODO: read from config file; hard-code for initial bring-up.
+    // Radar ID is the key mayara assigns when it detects the radar.
     // Check active IDs with: curl http://localhost:6502/v1/api/radars
     let mayara_url = "ws://127.0.0.1:6502/v2/api/radars/nav1034A/spokes";
 
-    log::info!("kahu-daemon connecting to mayara at {}", mayara_url);
+    let mut total_spokes: u64 = 0;
 
-    let (mut ws, _response) = connect_async(mayara_url)
-        .await
-        .with_context(|| format!("connecting to mayara at {mayara_url}"))?;
+    // Outer retry loop — keeps running across reconnects and replays.
+    loop {
+        log::info!("connecting to mayara at {}", mayara_url);
 
-    log::info!("connected — reading spokes");
-
-    let mut spoke_count: u64 = 0;
-
-    // Each WebSocket binary message is exactly one RadarMessage protobuf.
-    // WS provides message framing, so we don't need a length prefix.
-    while let Some(msg) = ws.next().await {
-        let msg = msg.context("WebSocket receive error")?;
-
-        let bytes = match msg {
-            WsMessage::Binary(b) => b,
-            WsMessage::Close(_) => {
-                log::info!("mayara closed connection — processed {} spokes", spoke_count);
-                break;
+        let ws = match connect_async(mayara_url).await {
+            Ok((ws, _)) => ws,
+            Err(e) => {
+                log::warn!("connection failed ({}), retrying in {}s", e, RETRY_DELAY.as_secs());
+                sleep(RETRY_DELAY).await;
+                continue;
             }
-            // ping/pong/text are not expected; skip them
-            _ => continue,
         };
 
-        let radar_msg =
-            RadarMessage::parse_from_bytes(&bytes).context("parsing RadarMessage protobuf")?;
+        log::info!("connected — reading spokes (total so far: {})", total_spokes);
+        let mut ws = ws;
 
-        for spoke in &radar_msg.spokes {
-            spoke_count += 1;
+        loop {
+            let msg = match ws.next().await {
+                Some(Ok(m)) => m,
+                Some(Err(e)) => {
+                    log::warn!("WebSocket error: {}", e);
+                    break; // reconnect
+                }
+                None => {
+                    log::info!("mayara closed stream — will reconnect");
+                    break; // reconnect
+                }
+            };
 
-            log::debug!(
-                "spoke #{}: angle={} bearing={:?} range={}m data_len={} lat={:?} lon={:?}",
-                spoke_count,
-                spoke.angle,
-                spoke.bearing,
-                spoke.range,
-                spoke.data.len(),
-                spoke.lat,
-                spoke.lon,
-            );
+            let bytes = match msg {
+                WsMessage::Binary(b) => b,
+                WsMessage::Close(_) => {
+                    log::info!("mayara sent close frame — will reconnect");
+                    break;
+                }
+                _ => continue,
+            };
 
-            // Print a brief summary every 512 spokes so progress is visible
-            // even without RUST_LOG=debug.
-            if spoke_count % 512 == 0 {
-                println!(
-                    "[{} spokes] last: angle={} range={}m pixels={}",
-                    spoke_count,
+            let radar_msg = match RadarMessage::parse_from_bytes(&bytes) {
+                Ok(m) => m,
+                Err(e) => {
+                    log::warn!("protobuf parse error: {}", e);
+                    continue;
+                }
+            };
+
+            for spoke in &radar_msg.spokes {
+                total_spokes += 1;
+
+                log::debug!(
+                    "spoke #{}: angle={} bearing={:?} range={}m pixels={} lat={:?} lon={:?}",
+                    total_spokes,
                     spoke.angle,
+                    spoke.bearing,
                     spoke.range,
-                    spoke.data.len()
+                    spoke.data.len(),
+                    spoke.lat,
+                    spoke.lon,
                 );
+
+                if total_spokes % 512 == 0 {
+                    println!(
+                        "[{} spokes] angle={} range={}m pixels={}",
+                        total_spokes,
+                        spoke.angle,
+                        spoke.range,
+                        spoke.data.len()
+                    );
+                }
             }
         }
-    }
 
-    println!("Done. Total spokes received: {}", spoke_count);
-    Ok(())
+        sleep(RETRY_DELAY).await;
+    }
 }
