@@ -1,6 +1,7 @@
 mod protos;
 
 use anyhow::Result;
+use clap::Parser;
 use futures_util::StreamExt;
 use protobuf::Message;
 use tokio::time::{sleep, Duration};
@@ -11,14 +12,20 @@ use protos::RadarMessage::RadarMessage;
 // How long to wait before retrying a failed connection.
 const RETRY_DELAY: Duration = Duration::from_secs(3);
 
+#[derive(Parser, Debug)]
+#[command(about = "KAHU vessel daemon — ingests mayara radar spokes")]
+struct Args {
+    /// Mayara WebSocket URL for the radar spoke stream.
+    /// Radar key comes from: curl http://<host>:6502/v1/api/radars
+    #[arg(long, default_value = "ws://127.0.0.1:6502/v1/api/spokes/nav1034A")]
+    mayara_url: String,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::init();
-
-    // TODO: read from config file; hard-code for initial bring-up.
-    // Radar ID is the key mayara assigns when it detects the radar.
-    // Check active IDs with: curl http://localhost:6502/v1/api/radars
-    let mayara_url = "ws://127.0.0.1:6502/v1/api/spokes/nav1034A";
+    let args = Args::parse();
+    let mayara_url = &args.mayara_url;
 
     let mut total_spokes: u64 = 0;
 
