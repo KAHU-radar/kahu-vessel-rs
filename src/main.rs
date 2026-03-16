@@ -18,7 +18,7 @@ async fn main() -> Result<()> {
     // TODO: read from config file; hard-code for initial bring-up.
     // Radar ID is the key mayara assigns when it detects the radar.
     // Check active IDs with: curl http://localhost:6502/v1/api/radars
-    let mayara_url = "ws://127.0.0.1:6502/v2/api/radars/nav1034A/spokes";
+    let mayara_url = "ws://127.0.0.1:6502/v1/api/spokes/nav1034A";
 
     let mut total_spokes: u64 = 0;
 
