@@ -17,7 +17,7 @@ const RETRY_DELAY: Duration = Duration::from_secs(3);
 struct Args {
     /// Mayara WebSocket URL for the radar spoke stream.
     /// Radar key comes from: curl http://<host>:6502/v1/api/radars
-    #[arg(long, default_value = "ws://127.0.0.1:6502/v1/api/spokes/nav1034A")]
+    #[arg(long, default_value = "ws://127.0.0.1:6502/signalk/v2/api/vessels/self/radars/nav1034A/spokes")]
     mayara_url: String,
 }
 
