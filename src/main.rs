@@ -15,7 +15,9 @@ async fn main() -> Result<()> {
     env_logger::init();
 
     // TODO: read from config file; hard-code for initial bring-up
-    let mayara_url = "ws://127.0.0.1:6502/v2/api/radars/0/spokes";
+    // Radar ID comes from mayara's detected radar key (e.g. "nav1034A").
+    // Check active IDs with: curl http://localhost:6502/v1/api/radars
+    let mayara_url = "ws://127.0.0.1:6502/v2/api/radars/nav1034A/spokes";
 
     log::info!("kahu-daemon connecting to mayara at {}", mayara_url);
 
