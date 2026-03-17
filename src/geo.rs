@@ -4,11 +4,6 @@
 /// which is accurate to better than 0.1 % within 24 nm — sufficient for
 /// radar target tracking.
 
-/// Convert a protobuf `int64` lat/lon field (1e-16 degrees) to decimal degrees.
-pub fn proto_to_deg(raw: i64) -> f64 {
-    raw as f64 * 1e-16
-}
-
 /// Convert polar radar coordinates to absolute lat/lon.
 ///
 /// * `own_lat_deg` / `own_lon_deg` – radar position (decimal degrees)
@@ -44,19 +39,6 @@ pub fn haversine_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
 mod tests {
     use super::*;
     use std::f64::consts::PI;
-
-    #[test]
-    fn proto_zero_is_zero_degrees() {
-        assert_eq!(proto_to_deg(0), 0.0);
-    }
-
-    #[test]
-    fn proto_roundtrip() {
-        // 52.3676° N stored as int64
-        let raw: i64 = (52.3676 / 1e-16) as i64;
-        let result = proto_to_deg(raw);
-        assert!((result - 52.3676).abs() < 1e-10);
-    }
 
     #[test]
     fn north_displacement() {
