@@ -5,10 +5,10 @@
 
 // Pixels must exceed this intensity to be counted.
 // Navico/HALO spokes use 4-bit pixel values (0–15); 0 = no return, 15 = max.
-// A threshold of 7 passes moderate-to-strong returns while rejecting noise.
-const THRESHOLD: u8 = 7;
+// A threshold of 10 passes only strong returns, rejecting sea clutter.
+const THRESHOLD: u8 = 10;
 // Blob must span at least this many pixels.
-const MIN_BLOB_PX: usize = 2;
+const MIN_BLOB_PX: usize = 3;
 // Blob wider than this is clutter/interference — skip it.
 const MAX_BLOB_PX: usize = 200;
 // Ignore this many pixels nearest the antenna (main bang / sidelobe).
@@ -94,7 +94,7 @@ mod tests {
     #[test]
     fn single_blob_detected() {
         let mut data = vec![0u8; 512];
-        // Plant a blob at pixels 100–109 (10 px wide, well above threshold).
+        // Plant a blob at pixels 100–109 (10 px wide, above threshold and MIN_BLOB_PX).
         for p in &mut data[100..110] {
             *p = 15;
         }
@@ -109,7 +109,9 @@ mod tests {
     #[test]
     fn blob_below_min_size_ignored() {
         let mut data = vec![0u8; 512];
-        data[100] = 200; // only 1 pixel — below MIN_BLOB_PX
+        // 2 pixels — below MIN_BLOB_PX (3)
+        data[100] = 15;
+        data[101] = 15;
         assert!(detect(&data, 25600, 0, 2048).is_empty());
     }
 
