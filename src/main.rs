@@ -120,7 +120,7 @@ async fn main() -> Result<()> {
                 // Own-ship position embedded in the spoke (1e-16 degrees).
                 // Update cache when fresh; fall back to cached value otherwise.
                 if let (Some(la), Some(lo)) = (spoke.lat, spoke.lon) {
-                    own_pos = Some((geo::proto_to_deg(la), geo::proto_to_deg(lo)));
+                    own_pos = Some((la, lo));
                 }
                 let (own_lat, own_lon) = match own_pos {
                     Some(p) => p,

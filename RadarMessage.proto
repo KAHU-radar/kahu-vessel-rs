@@ -23,8 +23,7 @@ option go_package = "../radar";
  * Likewise, time and lat/lon indicate the best effort when the spoke
  * was generated, and the lat/lon of the radar at the time of generation.
  *
- * Latitude and longitude are expressed in 10**-16 degrees, for compatibility
- * with NMEA-2000 data.
+ * Latitude and longitude are expressed in decimal degrees (double).
  */
 message RadarMessage {
     uint32 radar = 1;
@@ -33,8 +32,8 @@ message RadarMessage {
         optional uint32 bearing = 2; // [0..spokes>, offset from True North
         uint32 range = 3; // [meters], range in meters of the last pixel in data
         optional uint64 time = 4; // [millis since UNIX epoch] Time when spoke was generated or received
-        optional int64 lat = 6; // [1e-16 degree] Location of radar at time of generation
-        optional int64 lon = 7; // [1e-16 degree] Location of radar at time of generation
+        optional double lat = 6; // [decimal degrees] Location of radar at time of generation
+        optional double lon = 7; // [decimal degrees] Location of radar at time of generation
         bytes data = 5;
     }
     repeated Spoke spokes = 2;
