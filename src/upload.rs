@@ -8,7 +8,7 @@
 ///   5. On any error: reconnect and retry
 
 use std::io::Write;
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -88,11 +88,13 @@ impl Uploader {
 
     fn connect(&mut self) -> Result<()> {
         let addr = format!("{}:{}", self.host, self.port);
-        let stream = TcpStream::connect_timeout(
-            &addr.parse().context("invalid address")?,
-            CONNECT_TIMEOUT,
-        )
-        .context("TCP connect failed")?;
+        let socket_addr = addr
+            .to_socket_addrs()
+            .context("DNS lookup failed")?
+            .next()
+            .context("no address for host")?;
+        let stream = TcpStream::connect_timeout(&socket_addr, CONNECT_TIMEOUT)
+            .context("TCP connect failed")?;
         stream.set_nodelay(true)?;
         self.conn = Some(stream);
         self.call_id = 0;
