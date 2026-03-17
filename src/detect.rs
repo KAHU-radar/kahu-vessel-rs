@@ -5,8 +5,9 @@
 
 // Pixels must exceed this intensity to be counted.
 // Navico/HALO spokes use 4-bit pixel values (0–15); 0 = no return, 15 = max.
-// A threshold of 10 passes only strong returns, rejecting sea clutter.
-const THRESHOLD: u8 = 10;
+// A threshold of 14 passes only maximum-intensity returns (value 15/15).
+// Land clutter requires a proper land mask; this threshold is a stopgap.
+const THRESHOLD: u8 = 14;
 // Blob must span at least this many pixels.
 const MIN_BLOB_PX: usize = 3;
 // Blob wider than this is clutter/interference — skip it.
