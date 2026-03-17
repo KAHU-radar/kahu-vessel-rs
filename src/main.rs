@@ -89,8 +89,14 @@ async fn main() -> Result<()> {
             let bytes = match msg {
                 WsMessage::Binary(b) => b,
                 WsMessage::Close(_) => break 'stream,
+                WsMessage::Text(t) => {
+                    log::debug!("text message: {}", &t[..t.len().min(120)]);
+                    continue;
+                }
                 _ => continue,
             };
+
+            log::debug!("binary frame: {} bytes", bytes.len());
 
             let radar_msg = match RadarMessage::parse_from_bytes(&bytes) {
                 Ok(m) => m,
@@ -98,6 +104,11 @@ async fn main() -> Result<()> {
             };
 
             for spoke in &radar_msg.spokes {
+                log::debug!(
+                    "spoke angle={} bearing={:?} range={}m lat={:?} lon={:?} pixels={}",
+                    spoke.angle, spoke.bearing, spoke.range, spoke.lat, spoke.lon, spoke.data.len()
+                );
+
                 // Skip spokes without a true bearing — can't compute lat/lon.
                 let bearing = match spoke.bearing {
                     Some(b) => b,
