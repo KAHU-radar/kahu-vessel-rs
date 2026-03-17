@@ -3,8 +3,10 @@
 /// Scans the raw pixel array for consecutive runs of intensity above a
 /// threshold.  Each qualifying run produces one Detection at its centroid.
 
-// Pixels must exceed this intensity to be counted (0–255).
-const THRESHOLD: u8 = 50;
+// Pixels must exceed this intensity to be counted.
+// Navico/HALO spokes use 4-bit pixel values (0–15); 0 = no return, 15 = max.
+// A threshold of 7 passes moderate-to-strong returns while rejecting noise.
+const THRESHOLD: u8 = 7;
 // Blob must span at least this many pixels.
 const MIN_BLOB_PX: usize = 2;
 // Blob wider than this is clutter/interference — skip it.
@@ -85,7 +87,7 @@ mod tests {
 
     #[test]
     fn all_noise_returns_no_detections() {
-        let data = vec![10u8; 512];
+        let data = vec![3u8; 512]; // below threshold (0-15 range, threshold=7)
         assert!(detect(&data, 1000, 0, 2048).is_empty());
     }
 
@@ -94,7 +96,7 @@ mod tests {
         let mut data = vec![0u8; 512];
         // Plant a blob at pixels 100–109 (10 px wide, well above threshold).
         for p in &mut data[100..110] {
-            *p = 200;
+            *p = 15;
         }
         let dets = detect(&data, 25600, 0, 2048); // 50 m/px
         assert_eq!(dets.len(), 1);
@@ -116,7 +118,7 @@ mod tests {
         let mut data = vec![0u8; 512];
         // Blob within the first MIN_RANGE_PX pixels.
         for p in &mut data[0..3] {
-            *p = 200;
+            *p = 15;
         }
         assert!(detect(&data, 25600, 0, 2048).is_empty());
     }
@@ -125,7 +127,7 @@ mod tests {
     fn bearing_converted_correctly() {
         let mut data = vec![0u8; 512];
         for p in &mut data[100..110] {
-            *p = 200;
+            *p = 15;
         }
         // spoke 512 out of 2048 = 90° = π/2
         let dets = detect(&data, 25600, 512, 2048);
@@ -137,10 +139,10 @@ mod tests {
     fn two_blobs_detected() {
         let mut data = vec![0u8; 512];
         for p in &mut data[50..55] {
-            *p = 200;
+            *p = 15;
         }
         for p in &mut data[300..310] {
-            *p = 200;
+            *p = 15;
         }
         assert_eq!(detect(&data, 25600, 0, 2048).len(), 2);
     }
