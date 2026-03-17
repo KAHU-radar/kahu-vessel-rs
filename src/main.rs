@@ -63,6 +63,8 @@ async fn main() -> Result<()> {
     // Accumulate detections across spokes; flush once per revolution.
     let mut sweep_dets: Vec<(f64, f64)> = Vec::new();
     let mut prev_angle: Option<u32> = None;
+    // Cache own-ship position — spokes only carry lat/lon when NMEA is fresh.
+    let mut own_pos: Option<(f64, f64)> = None;
 
     loop {
         log::info!("connecting to mayara at {}", args.mayara_url);
@@ -116,9 +118,13 @@ async fn main() -> Result<()> {
                 };
 
                 // Own-ship position embedded in the spoke (1e-16 degrees).
-                let (own_lat, own_lon) = match (spoke.lat, spoke.lon) {
-                    (Some(la), Some(lo)) => (geo::proto_to_deg(la), geo::proto_to_deg(lo)),
-                    _ => continue,
+                // Update cache when fresh; fall back to cached value otherwise.
+                if let (Some(la), Some(lo)) = (spoke.lat, spoke.lon) {
+                    own_pos = Some((geo::proto_to_deg(la), geo::proto_to_deg(lo)));
+                }
+                let (own_lat, own_lon) = match own_pos {
+                    Some(p) => p,
+                    None => continue, // no position yet — skip until NMEA arrives
                 };
 
                 // Detect blobs on this spoke.
