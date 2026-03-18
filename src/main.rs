@@ -8,27 +8,22 @@ mod protos;
 use anyhow::Result;
 use chrono::Utc;
 use clap::Parser;
-use futures_util::StreamExt;
 use protobuf::Message as _;
-use tokio::time::{sleep, Duration};
-use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
+use tokio::io::{AsyncReadExt, BufReader};
 
 use clutter::ClutterMap;
 use protos::RadarMessage::RadarMessage;
 use tracker::{Tracker, MIN_FIXES};
 use upload::{TrackPoint, UploadTrack, Uploader};
 
-const RETRY_DELAY: Duration = Duration::from_secs(3);
 /// Spokes per full revolution — HALO radar default.  Override with --spokes.
 const DEFAULT_SPOKES_PER_REV: u32 = 2048;
 
 #[derive(Parser, Debug)]
 #[command(about = "KAHU vessel daemon — radar spokes → target tracks → TrackServer")]
+#[command(long_about = "Reads length-prefixed protobuf RadarMessages from stdin.\n\
+    Launch via: mayara-server --output ... | kahu-daemon [options]")]
 struct Args {
-    /// Mayara WebSocket URL for the spoke stream.
-    #[arg(long, default_value = "ws://127.0.0.1:6502/signalk/v2/api/vessels/self/radars/nav1034A/spokes")]
-    mayara_url: String,
-
     /// TrackServer hostname or IP.
     #[arg(long, default_value = "crowdsource.kahu.earth")]
     upload_host: String,
@@ -75,131 +70,130 @@ async fn main() -> Result<()> {
     // Cache own-ship position — spokes only carry lat/lon when NMEA is fresh.
     let mut own_pos: Option<(f64, f64)> = None;
 
-    loop {
-        log::info!("connecting to mayara at {}", args.mayara_url);
+    log::info!("reading mayara protobuf stream from stdin");
 
-        let ws = match connect_async(&args.mayara_url).await {
-            Ok((ws, _)) => ws,
+    let mut reader = BufReader::new(tokio::io::stdin());
+
+    loop {
+        // Each message is framed as: [u32 LE length][protobuf bytes].
+        // This matches the length prefix written by mayara's forward_output().
+        let mut len_buf = [0u8; 4];
+        match reader.read_exact(&mut len_buf).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                log::info!("stdin closed — mayara exited");
+                break;
+            }
             Err(e) => {
-                log::warn!("connection failed: {} — retrying in {}s", e, RETRY_DELAY.as_secs());
-                sleep(RETRY_DELAY).await;
+                log::error!("stdin read error: {}", e);
+                break;
+            }
+        }
+        let len = u32::from_le_bytes(len_buf) as usize;
+
+        let mut msg_buf = vec![0u8; len];
+        if let Err(e) = reader.read_exact(&mut msg_buf).await {
+            log::error!("stdin read error (body, expected {} bytes): {}", len, e);
+            break;
+        }
+
+        log::debug!("frame: {} bytes", len);
+
+        let radar_msg = match RadarMessage::parse_from_bytes(&msg_buf) {
+            Ok(m) => m,
+            Err(e) => {
+                log::warn!("protobuf parse error: {}", e);
                 continue;
             }
         };
 
-        log::info!("connected — reading spokes");
-        let mut ws = ws;
+        for spoke in &radar_msg.spokes {
+            log::debug!(
+                "spoke angle={} bearing={:?} range={}m lat={:?} lon={:?} pixels={}",
+                spoke.angle, spoke.bearing, spoke.range, spoke.lat, spoke.lon, spoke.data.len()
+            );
 
-        'stream: loop {
-            let msg = match ws.next().await {
-                Some(Ok(m)) => m,
-                Some(Err(e)) => { log::warn!("ws error: {}", e); break 'stream; }
-                None => { log::info!("stream closed — reconnecting"); break 'stream; }
+            // Skip spokes without a true bearing — can't compute lat/lon.
+            let bearing = match spoke.bearing {
+                Some(b) => b,
+                None => continue,
             };
 
-            let bytes = match msg {
-                WsMessage::Binary(b) => b,
-                WsMessage::Close(_) => break 'stream,
-                WsMessage::Text(t) => {
-                    log::debug!("text message: {}", &t[..t.len().min(120)]);
-                    continue;
-                }
-                _ => continue,
+            // Own-ship position embedded in the spoke.
+            // Update cache when fresh; fall back to cached value otherwise.
+            if let (Some(la), Some(lo)) = (spoke.lat, spoke.lon) {
+                own_pos = Some((la, lo));
+            }
+            let (own_lat, own_lon) = match own_pos {
+                Some(p) => p,
+                None => continue, // no position yet — skip until NMEA arrives
             };
 
-            log::debug!("binary frame: {} bytes", bytes.len());
+            // Detect blobs on this spoke.
+            let dets = detect::detect(&spoke.data, spoke.range, bearing, args.spokes);
 
-            let radar_msg = match RadarMessage::parse_from_bytes(&bytes) {
-                Ok(m) => m,
-                Err(e) => { log::warn!("protobuf parse error: {}", e); continue; }
-            };
-
-            for spoke in &radar_msg.spokes {
-                log::debug!(
-                    "spoke angle={} bearing={:?} range={}m lat={:?} lon={:?} pixels={}",
-                    spoke.angle, spoke.bearing, spoke.range, spoke.lat, spoke.lon, spoke.data.len()
+            // Convert each detection to lat/lon.
+            for d in dets {
+                let (lat, lon) = geo::polar_to_latlon(
+                    own_lat,
+                    own_lon,
+                    d.range_m as f64,
+                    d.bearing_rad as f64,
                 );
+                sweep_dets.push((lat, lon));
+            }
 
-                // Skip spokes without a true bearing — can't compute lat/lon.
-                let bearing = match spoke.bearing {
-                    Some(b) => b,
-                    None => continue,
-                };
+            // Detect a new revolution: angle wraps around or drops significantly.
+            let new_rev = prev_angle
+                .map(|prev| spoke.angle < prev && prev > args.spokes / 2)
+                .unwrap_or(false);
+            prev_angle = Some(spoke.angle);
 
-                // Own-ship position embedded in the spoke (1e-16 degrees).
-                // Update cache when fresh; fall back to cached value otherwise.
-                if let (Some(la), Some(lo)) = (spoke.lat, spoke.lon) {
-                    own_pos = Some((la, lo));
-                }
-                let (own_lat, own_lon) = match own_pos {
-                    Some(p) => p,
-                    None => continue, // no position yet — skip until NMEA arrives
-                };
-
-                // Detect blobs on this spoke.
-                let dets = detect::detect(&spoke.data, spoke.range, bearing, args.spokes);
-
-                // Convert each detection to lat/lon.
-                for d in dets {
-                    let (lat, lon) = geo::polar_to_latlon(
-                        own_lat,
-                        own_lon,
-                        d.range_m as f64,
-                        d.bearing_rad as f64,
-                    );
-                    sweep_dets.push((lat, lon));
-                }
-
-                // Detect a new revolution: angle wraps around or drops significantly.
-                let new_rev = prev_angle
-                    .map(|prev| spoke.angle < prev && prev > args.spokes / 2)
-                    .unwrap_or(false);
-                prev_angle = Some(spoke.angle);
-
-                if new_rev {
-                    let ts = Utc::now();
-                    let filtered: Vec<(f64, f64)> = if let Some(ref mut cm) = clutter {
-                        let f = cm.filter(&sweep_dets);
-                        log::debug!(
-                            "clutter: {}/{} dets passed ({} map cells)",
-                            f.len(), sweep_dets.len(), cm.active_cells()
-                        );
-                        f
-                    } else {
-                        sweep_dets.clone()
-                    };
-                    let lost = tracker.update(&filtered, ts);
+            if new_rev {
+                let ts = Utc::now();
+                let filtered: Vec<(f64, f64)> = if let Some(ref mut cm) = clutter {
+                    let f = cm.filter(&sweep_dets);
                     log::debug!(
-                        "sweep: {} detections, {} active tracks, {} flushed",
-                        filtered.len(),
-                        tracker.active_count(),
-                        lost.len()
+                        "clutter: {}/{} dets passed ({} map cells)",
+                        f.len(), sweep_dets.len(), cm.active_cells()
                     );
-                    sweep_dets.clear();
+                    f
+                } else {
+                    sweep_dets.clone()
+                };
+                let lost = tracker.update(&filtered, ts);
+                log::debug!(
+                    "sweep: {} detections, {} active tracks, {} flushed",
+                    filtered.len(),
+                    tracker.active_count(),
+                    lost.len()
+                );
+                sweep_dets.clear();
 
-                    for track in lost {
-                        flush_track(track, &mut uploader);
-                    }
+                for track in lost {
+                    flush_track(track, &mut uploader);
                 }
             }
         }
-
-        // On disconnect: flush everything so we don't lose data.
-        let all = tracker.drain();
-        log::info!("disconnected — flushing {} tracks", all.len());
-        for track in all {
-            flush_track(track, &mut uploader);
-        }
-        sweep_dets.clear();
-        prev_angle = None;
-
-        sleep(RETRY_DELAY).await;
     }
+
+    // Flush all remaining active tracks on clean exit.
+    let all = tracker.drain();
+    log::info!("flushing {} remaining tracks", all.len());
+    for track in all {
+        flush_track(track, &mut uploader);
+    }
+
+    Ok(())
 }
 
 fn flush_track(track: tracker::Track, uploader: &mut Option<Uploader>) {
     if track.fixes.len() < MIN_FIXES {
-        log::debug!("dropping track {} ({} fixes)", &track.id.to_string()[..8], track.fixes.len());
+        log::debug!(
+            "dropping track {} ({} fixes)",
+            &track.id.to_string()[..8],
+            track.fixes.len()
+        );
         return;
     }
 
