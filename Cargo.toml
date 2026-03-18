@@ -13,6 +13,10 @@ path = "src/main.rs"
 # Async runtime — same choice as mayara
 tokio = { version = "1", features = ["full"] }
 
+# WebSocket client — connects to mayara's spoke stream endpoint
+tokio-tungstenite = { version = "0.24", features = ["connect"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+
 
 # Protobuf — same version as mayara so we share RadarMessage type definitions
 protobuf = "3.5.1"

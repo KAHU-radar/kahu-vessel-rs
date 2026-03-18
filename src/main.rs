@@ -8,8 +8,10 @@ mod protos;
 use anyhow::Result;
 use chrono::Utc;
 use clap::Parser;
+use futures_util::StreamExt;
 use protobuf::Message as _;
 use tokio::io::{AsyncReadExt, BufReader};
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message as WsMessage};
 
 use clutter::ClutterMap;
 use protos::RadarMessage::RadarMessage;
@@ -21,8 +23,10 @@ const DEFAULT_SPOKES_PER_REV: u32 = 2048;
 
 #[derive(Parser, Debug)]
 #[command(about = "KAHU vessel daemon — radar spokes → target tracks → TrackServer")]
-#[command(long_about = "Reads length-prefixed protobuf RadarMessages from stdin.\n\
-    Launch via: mayara-server --output ... | kahu-daemon [options]")]
+#[command(long_about = "Reads RadarMessages from mayara via WebSocket (default) or length-prefixed\n\
+    stdin stream.\n\
+    WebSocket:  kahu-daemon --ws-url ws://localhost:6502/signalk/v2/api/vessels/self/radars/<id>/spokes\n\
+    Stdin pipe: mayara --output ... | kahu-daemon --stdin")]
 struct Args {
     /// TrackServer hostname or IP.
     #[arg(long, default_value = "crowdsource.kahu.earth")]
@@ -49,6 +53,17 @@ struct Args {
     /// warm-up period.  Recommended for coastal deployments.
     #[arg(long, default_value_t = false)]
     land_filter: bool,
+
+    /// WebSocket URL for mayara's spoke stream.
+    /// e.g. ws://localhost:6502/signalk/v2/api/vessels/self/radars/<id>/spokes
+    /// Takes precedence over --stdin if both are given.
+    #[arg(long)]
+    ws_url: Option<String>,
+
+    /// Read length-prefixed protobuf frames from stdin (legacy / pipe mode).
+    /// Use when piping: mayara --output ... | kahu-daemon --stdin
+    #[arg(long, default_value_t = false)]
+    stdin: bool,
 }
 
 #[tokio::main]
@@ -62,21 +77,185 @@ async fn main() -> Result<()> {
         Some(Uploader::new(&args.upload_host, args.upload_port, &args.api_key)?)
     };
 
-    let mut tracker = Tracker::new();
-    let mut clutter = args.land_filter.then(ClutterMap::new);
-    // Accumulate detections across spokes; flush once per revolution.
-    let mut sweep_dets: Vec<(f64, f64)> = Vec::new();
-    let mut prev_angle: Option<u32> = None;
-    // Cache own-ship position — spokes only carry lat/lon when NMEA is fresh.
-    let mut own_pos: Option<(f64, f64)> = None;
+    let mut state = ProcessState::new(args.spokes, args.land_filter);
 
-    log::info!("reading mayara protobuf stream from stdin");
+    if let Some(ref url) = args.ws_url {
+        run_websocket(&mut state, url, &mut uploader).await?;
+    } else {
+        // Default: read from stdin (length-prefixed frames written by mayara --output
+        // after the framing fix, or piped via --stdin flag).
+        run_stdin(&mut state, &mut uploader).await?;
+    }
+
+    // Flush all remaining active tracks on clean exit.
+    let all = state.tracker.drain();
+    log::info!("flushing {} remaining tracks", all.len());
+    for track in all {
+        flush_track(track, &mut uploader);
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Processing state — shared between stdin and WebSocket input paths
+// ---------------------------------------------------------------------------
+
+struct ProcessState {
+    tracker: Tracker,
+    clutter: Option<ClutterMap>,
+    sweep_dets: Vec<(f64, f64)>,
+    prev_angle: Option<u32>,
+    own_pos: Option<(f64, f64)>,
+    spokes_per_rev: u32,
+}
+
+impl ProcessState {
+    fn new(spokes_per_rev: u32, land_filter: bool) -> Self {
+        Self {
+            tracker: Tracker::new(),
+            clutter: land_filter.then(ClutterMap::new),
+            sweep_dets: Vec::new(),
+            prev_angle: None,
+            own_pos: None,
+            spokes_per_rev,
+        }
+    }
+
+    /// Parse one serialised RadarMessage and process all its spokes.
+    /// Returns tracks that completed during this message.
+    fn process_bytes(&mut self, bytes: &[u8]) -> Vec<tracker::Track> {
+        let radar_msg = match RadarMessage::parse_from_bytes(bytes) {
+            Ok(m) => m,
+            Err(e) => {
+                log::warn!("protobuf parse error: {}", e);
+                return vec![];
+            }
+        };
+
+        let mut flushed = Vec::new();
+
+        for spoke in &radar_msg.spokes {
+            log::debug!(
+                "spoke angle={} bearing={:?} range={}m lat={:?} lon={:?} pixels={}",
+                spoke.angle,
+                spoke.bearing,
+                spoke.range,
+                spoke.lat,
+                spoke.lon,
+                spoke.data.len()
+            );
+
+            // Skip spokes without a true bearing — can't compute lat/lon.
+            let bearing = match spoke.bearing {
+                Some(b) => b,
+                None => continue,
+            };
+
+            // Own-ship position embedded in the spoke.
+            if let (Some(la), Some(lo)) = (spoke.lat, spoke.lon) {
+                self.own_pos = Some((la, lo));
+            }
+            let (own_lat, own_lon) = match self.own_pos {
+                Some(p) => p,
+                None => continue, // no position yet — skip until NMEA arrives
+            };
+
+            let dets = detect::detect(&spoke.data, spoke.range, bearing, self.spokes_per_rev);
+
+            for d in dets {
+                let (lat, lon) = geo::polar_to_latlon(
+                    own_lat,
+                    own_lon,
+                    d.range_m as f64,
+                    d.bearing_rad as f64,
+                );
+                self.sweep_dets.push((lat, lon));
+            }
+
+            // Detect a new revolution: angle wraps around or drops significantly.
+            let new_rev = self
+                .prev_angle
+                .map(|prev| spoke.angle < prev && prev > self.spokes_per_rev / 2)
+                .unwrap_or(false);
+            self.prev_angle = Some(spoke.angle);
+
+            if new_rev {
+                let ts = Utc::now();
+                let filtered: Vec<(f64, f64)> = if let Some(ref mut cm) = self.clutter {
+                    let f = cm.filter(&self.sweep_dets);
+                    log::debug!(
+                        "clutter: {}/{} dets passed ({} map cells)",
+                        f.len(),
+                        self.sweep_dets.len(),
+                        cm.active_cells()
+                    );
+                    f
+                } else {
+                    self.sweep_dets.clone()
+                };
+                let lost = self.tracker.update(&filtered, ts);
+                log::debug!(
+                    "sweep: {} detections, {} active tracks, {} flushed",
+                    filtered.len(),
+                    self.tracker.active_count(),
+                    lost.len()
+                );
+                self.sweep_dets.clear();
+                flushed.extend(lost);
+            }
+        }
+
+        flushed
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket input — each binary WS frame is one complete RadarMessage protobuf
+// ---------------------------------------------------------------------------
+
+async fn run_websocket(
+    state: &mut ProcessState,
+    url: &str,
+    uploader: &mut Option<Uploader>,
+) -> Result<()> {
+    log::info!("connecting to mayara WebSocket: {}", url);
+
+    let (ws_stream, _response) = connect_async(url).await?;
+    log::info!("WebSocket connected");
+
+    let (_write, mut read) = ws_stream.split();
+
+    while let Some(msg) = read.next().await {
+        match msg? {
+            WsMessage::Binary(data) => {
+                log::debug!("ws frame: {} bytes", data.len());
+                let tracks = state.process_bytes(&data);
+                for track in tracks {
+                    flush_track(track, uploader);
+                }
+            }
+            WsMessage::Close(_) => {
+                log::info!("WebSocket closed by server");
+                break;
+            }
+            WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Text(_) | WsMessage::Frame(_) => {}
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Stdin input — length-prefixed frames: [u32 LE length][protobuf bytes]
+// ---------------------------------------------------------------------------
+
+async fn run_stdin(state: &mut ProcessState, uploader: &mut Option<Uploader>) -> Result<()> {
+    log::info!("reading mayara protobuf stream from stdin (length-prefixed)");
 
     let mut reader = BufReader::new(tokio::io::stdin());
 
     loop {
-        // Each message is framed as: [u32 LE length][protobuf bytes].
-        // This matches the length prefix written by mayara's forward_output().
         let mut len_buf = [0u8; 4];
         match reader.read_exact(&mut len_buf).await {
             Ok(_) => {}
@@ -99,93 +278,18 @@ async fn main() -> Result<()> {
 
         log::debug!("frame: {} bytes", len);
 
-        let radar_msg = match RadarMessage::parse_from_bytes(&msg_buf) {
-            Ok(m) => m,
-            Err(e) => {
-                log::warn!("protobuf parse error: {}", e);
-                continue;
-            }
-        };
-
-        for spoke in &radar_msg.spokes {
-            log::debug!(
-                "spoke angle={} bearing={:?} range={}m lat={:?} lon={:?} pixels={}",
-                spoke.angle, spoke.bearing, spoke.range, spoke.lat, spoke.lon, spoke.data.len()
-            );
-
-            // Skip spokes without a true bearing — can't compute lat/lon.
-            let bearing = match spoke.bearing {
-                Some(b) => b,
-                None => continue,
-            };
-
-            // Own-ship position embedded in the spoke.
-            // Update cache when fresh; fall back to cached value otherwise.
-            if let (Some(la), Some(lo)) = (spoke.lat, spoke.lon) {
-                own_pos = Some((la, lo));
-            }
-            let (own_lat, own_lon) = match own_pos {
-                Some(p) => p,
-                None => continue, // no position yet — skip until NMEA arrives
-            };
-
-            // Detect blobs on this spoke.
-            let dets = detect::detect(&spoke.data, spoke.range, bearing, args.spokes);
-
-            // Convert each detection to lat/lon.
-            for d in dets {
-                let (lat, lon) = geo::polar_to_latlon(
-                    own_lat,
-                    own_lon,
-                    d.range_m as f64,
-                    d.bearing_rad as f64,
-                );
-                sweep_dets.push((lat, lon));
-            }
-
-            // Detect a new revolution: angle wraps around or drops significantly.
-            let new_rev = prev_angle
-                .map(|prev| spoke.angle < prev && prev > args.spokes / 2)
-                .unwrap_or(false);
-            prev_angle = Some(spoke.angle);
-
-            if new_rev {
-                let ts = Utc::now();
-                let filtered: Vec<(f64, f64)> = if let Some(ref mut cm) = clutter {
-                    let f = cm.filter(&sweep_dets);
-                    log::debug!(
-                        "clutter: {}/{} dets passed ({} map cells)",
-                        f.len(), sweep_dets.len(), cm.active_cells()
-                    );
-                    f
-                } else {
-                    sweep_dets.clone()
-                };
-                let lost = tracker.update(&filtered, ts);
-                log::debug!(
-                    "sweep: {} detections, {} active tracks, {} flushed",
-                    filtered.len(),
-                    tracker.active_count(),
-                    lost.len()
-                );
-                sweep_dets.clear();
-
-                for track in lost {
-                    flush_track(track, &mut uploader);
-                }
-            }
+        let tracks = state.process_bytes(&msg_buf);
+        for track in tracks {
+            flush_track(track, uploader);
         }
-    }
-
-    // Flush all remaining active tracks on clean exit.
-    let all = tracker.drain();
-    log::info!("flushing {} remaining tracks", all.len());
-    for track in all {
-        flush_track(track, &mut uploader);
     }
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Track flushing — shared by both input paths
+// ---------------------------------------------------------------------------
 
 fn flush_track(track: tracker::Track, uploader: &mut Option<Uploader>) {
     if track.fixes.len() < MIN_FIXES {
