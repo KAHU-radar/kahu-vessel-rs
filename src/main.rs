@@ -1,3 +1,4 @@
+mod clutter;
 mod detect;
 mod geo;
 mod tracker;
@@ -12,6 +13,7 @@ use protobuf::Message as _;
 use tokio::time::{sleep, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 
+use clutter::ClutterMap;
 use protos::RadarMessage::RadarMessage;
 use tracker::{Tracker, MIN_FIXES};
 use upload::{TrackPoint, UploadTrack, Uploader};
@@ -46,6 +48,12 @@ struct Args {
     /// Dry-run: detect and track but do not upload.
     #[arg(long, default_value_t = false)]
     dry_run: bool,
+
+    /// Enable the sliding-window land / clutter filter.
+    /// Suppresses stationary returns (coastlines, docks) after a ~30-sweep
+    /// warm-up period.  Recommended for coastal deployments.
+    #[arg(long, default_value_t = false)]
+    land_filter: bool,
 }
 
 #[tokio::main]
@@ -60,6 +68,7 @@ async fn main() -> Result<()> {
     };
 
     let mut tracker = Tracker::new();
+    let mut clutter = args.land_filter.then(ClutterMap::new);
     // Accumulate detections across spokes; flush once per revolution.
     let mut sweep_dets: Vec<(f64, f64)> = Vec::new();
     let mut prev_angle: Option<u32> = None;
@@ -149,10 +158,20 @@ async fn main() -> Result<()> {
 
                 if new_rev {
                     let ts = Utc::now();
-                    let lost = tracker.update(&sweep_dets, ts);
+                    let filtered: Vec<(f64, f64)> = if let Some(ref mut cm) = clutter {
+                        let f = cm.filter(&sweep_dets);
+                        log::debug!(
+                            "clutter: {}/{} dets passed ({} map cells)",
+                            f.len(), sweep_dets.len(), cm.active_cells()
+                        );
+                        f
+                    } else {
+                        sweep_dets.clone()
+                    };
+                    let lost = tracker.update(&filtered, ts);
                     log::debug!(
-                        "sweep: {} detections, {} active tracks, {} lost",
-                        sweep_dets.len(),
+                        "sweep: {} detections, {} active tracks, {} flushed",
+                        filtered.len(),
                         tracker.active_count(),
                         lost.len()
                     );

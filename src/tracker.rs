@@ -19,6 +19,11 @@ const MAX_MISSED_SWEEPS: u32 = 8;
 /// Minimum fixes required before a track is worth uploading.
 pub const MIN_FIXES: usize = 3;
 
+/// Segment a track once it reaches this many fixes, even if still active.
+/// Prevents unbounded memory growth and enables regular uploads during long
+/// radar sessions. At ~1 Hz sweep rate, 20 = first upload within ~20 s.
+const MAX_TRACK_FIXES: usize = 20;
+
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -117,6 +122,19 @@ impl Tracker {
                 i += 1;
             }
         }
+
+        // --- segment long tracks: flush accumulated fixes and keep last as seed ---
+        // Prevents unbounded memory growth and enables periodic uploads without
+        // requiring the target to disappear first.
+        for track in self.tracks.iter_mut() {
+            if track.fixes.len() >= MAX_TRACK_FIXES {
+                let last_fix = track.fixes.last().expect("track always has at least one fix").clone();
+                let old_fixes = std::mem::replace(&mut track.fixes, vec![last_fix]);
+                let old_id = std::mem::replace(&mut track.id, Uuid::new_v4());
+                lost.push(Track { id: old_id, fixes: old_fixes, missed: 0 });
+            }
+        }
+
         lost
     }
 
