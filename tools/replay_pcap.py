@@ -136,6 +136,8 @@ def main() -> None:
                         help="Loop continuously (Ctrl-C to stop)")
     parser.add_argument("--ttl", type=int, default=4,
                         help="Multicast TTL (default 4; must be >1 to leave the local machine)")
+    parser.add_argument("--iface", default="127.0.0.1",
+                        help="Local IP address of the outgoing interface (default: 127.0.0.1 for loopback)")
     args = parser.parse_args()
 
     print(f"Loading {args.pcap} ...")
@@ -148,6 +150,9 @@ def main() -> None:
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, args.ttl)
+    # Tell the kernel which interface to use for multicast sends.
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF,
+                    socket.inet_aton(args.iface))
 
     run = 0
     try:
