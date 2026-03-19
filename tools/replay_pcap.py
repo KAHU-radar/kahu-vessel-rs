@@ -119,11 +119,14 @@ def replay_once(packets: list, sock: socket.socket, speed: float) -> int:
         gap = target - time.monotonic()
         if gap > 0:
             time.sleep(gap)
+        # Redirect broadcast addresses to loopback — Linux won't send to
+        # 255.255.255.255 without binding to a specific interface.
+        send_ip = "127.0.0.1" if dst_ip.endswith(".255") else dst_ip
         try:
-            sock.sendto(payload, (dst_ip, dst_port))
+            sock.sendto(payload, (send_ip, dst_port))
             sent += 1
         except OSError as e:
-            print(f"  send error: {e}", file=sys.stderr)
+            print(f"  send error to {send_ip}:{dst_port}: {e}", file=sys.stderr)
     return sent
 
 
