@@ -44,6 +44,12 @@ struct Args {
     #[arg(long, default_value_t = DEFAULT_SPOKES_PER_REV)]
     spokes: u32,
 
+    /// Flush all active tracks and reconnect if no spoke data arrives for this
+    /// many seconds.  Useful when a radar goes unexpectedly silent — partial
+    /// tracks are uploaded rather than lost.  0 = disabled (default).
+    #[arg(long, default_value_t = 0)]
+    spoke_timeout: u64,
+
     /// Dry-run: detect and track but do not upload.
     #[arg(long, default_value_t = false)]
     dry_run: bool,
@@ -80,7 +86,7 @@ async fn main() -> Result<()> {
     let mut state = ProcessState::new(args.spokes, args.land_filter);
 
     if let Some(ref url) = args.ws_url {
-        run_websocket(&mut state, url, &mut uploader).await?;
+        run_websocket(&mut state, url, &mut uploader, args.spoke_timeout).await?;
     } else {
         // Default: read from stdin (length-prefixed frames written by mayara --output
         // after the framing fix, or piped via --stdin flag).
@@ -221,6 +227,7 @@ async fn run_websocket(
     state: &mut ProcessState,
     url: &str,
     uploader: &mut Option<Uploader>,
+    spoke_timeout: u64,
 ) -> Result<()> {
     // Spawn a task that watches for Ctrl-C and signals the watch channel.
     // All select! arms below subscribe to this channel so shutdown interrupts
@@ -243,9 +250,18 @@ async fn run_websocket(
                 log::info!("WebSocket connected");
                 let (_write, mut read) = ws_stream.split();
 
-                // Inner loop: process frames until the connection drops or
-                // shutdown is requested.
+                // Inner loop: process frames until the connection drops,
+                // a spoke timeout fires, or shutdown is requested.
                 loop {
+                    // Build a timeout future only when spoke_timeout > 0.
+                    let maybe_timeout = async {
+                        if spoke_timeout > 0 {
+                            tokio::time::sleep(tokio::time::Duration::from_secs(spoke_timeout)).await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    };
+
                     tokio::select! {
                         msg = read.next() => {
                             match msg {
@@ -266,6 +282,15 @@ async fn run_websocket(
                                 }
                                 Some(Ok(_)) => {} // Ping, Pong, Text, Frame — ignore
                             }
+                        }
+                        _ = maybe_timeout => {
+                            log::info!("no spoke data for {}s — flushing tracks", spoke_timeout);
+                            let stale = state.tracker.drain();
+                            log::info!("flushing {} stale tracks", stale.len());
+                            for track in stale {
+                                flush_track(track, uploader);
+                            }
+                            break; // triggers reconnect; fresh tracker state
                         }
                         Ok(_) = stop_rx.changed() => {
                             // SIGINT fired — break inner loop; outer loop will
