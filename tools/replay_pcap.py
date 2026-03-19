@@ -149,6 +149,7 @@ def main() -> None:
     print(f"Loaded {len(packets)} UDP packets  ({duration:.1f}s of data)")
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, args.ttl)
     # Tell the kernel which interface to use for multicast sends.
     sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF,
