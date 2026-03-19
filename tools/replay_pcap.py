@@ -108,7 +108,7 @@ def load_udp_packets(pcap_path: str) -> list[tuple[float, str, int, bytes]]:
 # Replay
 # ---------------------------------------------------------------------------
 
-def replay_once(packets: list, sock: socket.socket, speed: float) -> int:
+def replay_once(packets: list, sock: socket.socket, speed: float, loopback: bool) -> int:
     if not packets:
         return 0
     first_ts = packets[0][0]
@@ -121,9 +121,10 @@ def replay_once(packets: list, sock: socket.socket, speed: float) -> int:
             time.sleep(gap)
         if dst_port == 0:
             continue  # port 0 is invalid for UDP sendto
-        # Redirect broadcast addresses to loopback — Linux won't send to
-        # 255.255.255.255 without binding to a specific interface.
-        send_ip = "127.0.0.1" if dst_ip.endswith(".255") else dst_ip
+        # On loopback the kernel won't route 255.255.255.255, so redirect to
+        # 127.0.0.1.  On a real interface the broadcast reaches the subnet
+        # directly, so send as-is.
+        send_ip = "127.0.0.1" if (dst_ip.endswith(".255") and loopback) else dst_ip
         try:
             sock.sendto(payload, (send_ip, dst_port))
             sent += 1
@@ -160,11 +161,12 @@ def main() -> None:
     sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF,
                     socket.inet_aton(args.iface))
 
+    loopback = args.iface == "127.0.0.1"
     run = 0
     try:
         while True:
             run += 1
-            sent = replay_once(packets, sock, args.speed)
+            sent = replay_once(packets, sock, args.speed, loopback)
             print(f"Run {run}: sent {sent} packets")
             if not args.loop:
                 break
