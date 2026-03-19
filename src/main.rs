@@ -252,21 +252,34 @@ async fn run_websocket(
 
                 // Inner loop: process frames until the connection drops,
                 // a spoke timeout fires, or shutdown is requested.
-                loop {
-                    // Build a timeout future only when spoke_timeout > 0.
-                    let maybe_timeout = async {
-                        if spoke_timeout > 0 {
-                            tokio::time::sleep(tokio::time::Duration::from_secs(spoke_timeout)).await;
-                        } else {
-                            std::future::pending::<()>().await;
-                        }
-                    };
+                //
+                // The sleep is pinned and persists across iterations so that
+                // non-binary frames (pings, text metadata) do NOT reset the
+                // countdown — only arriving binary spoke data does.
+                let far_future = tokio::time::Instant::now()
+                    + tokio::time::Duration::from_secs(u64::MAX / 2);
+                let initial_deadline = if spoke_timeout > 0 {
+                    tokio::time::Instant::now()
+                        + tokio::time::Duration::from_secs(spoke_timeout)
+                } else {
+                    far_future
+                };
+                let sleep = tokio::time::sleep_until(initial_deadline);
+                tokio::pin!(sleep);
 
+                loop {
                     tokio::select! {
                         msg = read.next() => {
                             match msg {
                                 Some(Ok(WsMessage::Binary(data))) => {
                                     log::debug!("ws frame: {} bytes", data.len());
+                                    // Reset the timeout — we just received spoke data.
+                                    if spoke_timeout > 0 {
+                                        sleep.as_mut().reset(
+                                            tokio::time::Instant::now()
+                                                + tokio::time::Duration::from_secs(spoke_timeout),
+                                        );
+                                    }
                                     let tracks = state.process_bytes(&data);
                                     for track in tracks {
                                         flush_track(track, uploader);
@@ -283,13 +296,16 @@ async fn run_websocket(
                                 Some(Ok(_)) => {} // Ping, Pong, Text, Frame — ignore
                             }
                         }
-                        _ = maybe_timeout => {
+                        _ = &mut sleep => {
                             log::info!("no spoke data for {}s — flushing tracks", spoke_timeout);
                             let stale = state.tracker.drain();
                             log::info!("flushing {} stale tracks", stale.len());
                             for track in stale {
                                 flush_track(track, uploader);
                             }
+                            // Push deadline far into future so this arm doesn't
+                            // re-fire immediately on the next reconnect cycle.
+                            sleep.as_mut().reset(far_future);
                             break; // triggers reconnect; fresh tracker state
                         }
                         Ok(_) = stop_rx.changed() => {
