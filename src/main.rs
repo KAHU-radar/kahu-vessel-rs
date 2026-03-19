@@ -211,35 +211,83 @@ impl ProcessState {
 }
 
 // ---------------------------------------------------------------------------
-// WebSocket input — each binary WS frame is one complete RadarMessage protobuf
+// WebSocket input — reconnecting loop with graceful SIGINT shutdown
 // ---------------------------------------------------------------------------
+
+/// Seconds to wait between reconnect attempts.
+const RECONNECT_DELAY_S: u64 = 5;
 
 async fn run_websocket(
     state: &mut ProcessState,
     url: &str,
     uploader: &mut Option<Uploader>,
 ) -> Result<()> {
-    log::info!("connecting to mayara WebSocket: {}", url);
+    // Spawn a task that watches for Ctrl-C and signals the watch channel.
+    // All select! arms below subscribe to this channel so shutdown interrupts
+    // both the active connection and any reconnect sleep.
+    let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.ok();
+        log::info!("SIGINT received — will flush tracks and exit");
+        let _ = stop_tx.send(true);
+    });
 
-    let (ws_stream, _response) = connect_async(url).await?;
-    log::info!("WebSocket connected");
+    loop {
+        if *stop_rx.borrow() {
+            break;
+        }
 
-    let (_write, mut read) = ws_stream.split();
+        log::info!("connecting to {}", url);
+        match connect_async(url).await {
+            Ok((ws_stream, _)) => {
+                log::info!("WebSocket connected");
+                let (_write, mut read) = ws_stream.split();
 
-    while let Some(msg) = read.next().await {
-        match msg? {
-            WsMessage::Binary(data) => {
-                log::debug!("ws frame: {} bytes", data.len());
-                let tracks = state.process_bytes(&data);
-                for track in tracks {
-                    flush_track(track, uploader);
+                // Inner loop: process frames until the connection drops or
+                // shutdown is requested.
+                loop {
+                    tokio::select! {
+                        msg = read.next() => {
+                            match msg {
+                                Some(Ok(WsMessage::Binary(data))) => {
+                                    log::debug!("ws frame: {} bytes", data.len());
+                                    let tracks = state.process_bytes(&data);
+                                    for track in tracks {
+                                        flush_track(track, uploader);
+                                    }
+                                }
+                                Some(Ok(WsMessage::Close(_))) | None => {
+                                    log::info!("WebSocket closed by server — will reconnect");
+                                    break;
+                                }
+                                Some(Err(e)) => {
+                                    log::warn!("WebSocket error: {} — will reconnect", e);
+                                    break;
+                                }
+                                Some(Ok(_)) => {} // Ping, Pong, Text, Frame — ignore
+                            }
+                        }
+                        Ok(_) = stop_rx.changed() => {
+                            // SIGINT fired — break inner loop; outer loop will
+                            // see stop=true and exit, then main() drains tracks.
+                            break;
+                        }
+                    }
                 }
             }
-            WsMessage::Close(_) => {
-                log::info!("WebSocket closed by server");
-                break;
+            Err(e) => {
+                log::warn!("connection failed: {} — retrying in {}s", e, RECONNECT_DELAY_S);
             }
-            WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Text(_) | WsMessage::Frame(_) => {}
+        }
+
+        if *stop_rx.borrow() {
+            break;
+        }
+
+        // Wait before reconnecting, but exit immediately on SIGINT.
+        tokio::select! {
+            _ = tokio::time::sleep(tokio::time::Duration::from_secs(RECONNECT_DELAY_S)) => {}
+            Ok(_) = stop_rx.changed() => {}
         }
     }
 
