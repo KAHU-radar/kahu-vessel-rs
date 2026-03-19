@@ -9,9 +9,11 @@ use uuid::Uuid;
 
 use crate::geo::haversine_m;
 
-/// Maximum distance (m) a detection may be from a track's last fix and still
-/// be considered the same target.
-const GATE_M: f64 = 500.0;
+/// Maximum distance (m) a detection may be from a track's *predicted* position
+/// and still be considered the same target.  At 1 Hz, a 30-knot vessel moves
+/// ~15 m/sweep — 200 m gives ample headroom while preventing cross-track swaps
+/// when ships pass within a few hundred metres of each other.
+const GATE_M: f64 = 200.0;
 
 /// Number of consecutive sweeps a track can go unupdated before it is lost.
 const MAX_MISSED_SWEEPS: u32 = 8;
@@ -53,9 +55,31 @@ impl Track {
         self.fixes.last().expect("track always has at least one fix")
     }
 
-    fn distance_to(&self, lat: f64, lon: f64) -> f64 {
-        let l = self.last();
-        haversine_m(l.lat, l.lon, lat, lon)
+    /// Dead-reckoning: predict position at `now` using the velocity estimated
+    /// from the last two fixes.  Falls back to the last fix when there is only
+    /// one fix or the inter-fix interval is zero.
+    fn predicted_pos(&self, now: DateTime<Utc>) -> (f64, f64) {
+        let n = self.fixes.len();
+        if n < 2 {
+            let l = self.last();
+            return (l.lat, l.lon);
+        }
+        let f1 = &self.fixes[n - 2];
+        let f2 = &self.fixes[n - 1];
+        let dt_hist = (f2.ts - f1.ts).num_milliseconds() as f64 / 1000.0;
+        if dt_hist <= 0.0 {
+            return (f2.lat, f2.lon);
+        }
+        let vlat = (f2.lat - f1.lat) / dt_hist;
+        let vlon = (f2.lon - f1.lon) / dt_hist;
+        let dt_pred = (now - f2.ts).num_milliseconds() as f64 / 1000.0;
+        let dt_pred = dt_pred.max(0.0);
+        (f2.lat + vlat * dt_pred, f2.lon + vlon * dt_pred)
+    }
+
+    fn distance_to(&self, lat: f64, lon: f64, now: DateTime<Utc>) -> f64 {
+        let (plat, plon) = self.predicted_pos(now);
+        haversine_m(plat, plon, lat, lon)
     }
 }
 
@@ -85,7 +109,7 @@ impl Tracker {
                 .iter()
                 .enumerate()
                 .filter(|(t_i, _)| !matched[*t_i])
-                .map(|(t_i, t)| (t_i, t.distance_to(lat, lon)))
+                .map(|(t_i, t)| (t_i, t.distance_to(lat, lon, ts)))
                 .filter(|(_, d)| *d < GATE_M)
                 .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap());
 

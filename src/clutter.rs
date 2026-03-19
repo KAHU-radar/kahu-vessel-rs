@@ -24,9 +24,9 @@ const LON_SCALE: f64 = 1000.0;
 pub const WINDOW_SWEEPS: usize = 30;
 
 /// Suppress a cell if it appeared in at least this many of the last
-/// `WINDOW_SWEEPS` sweeps (25/30 ≈ 83 %).  Land always scores 30/30;
-/// a vessel visible for ≤ 5 sweeps in one cell scores ≤ 5/30.
-pub const SUPPRESS_THRESHOLD: u32 = 25;
+/// `WINDOW_SWEEPS` sweeps (27/30 = 90 %).  Land always scores 30/30;
+/// a vessel visible for ≤ 3 sweeps in one cell scores ≤ 3/30.
+pub const SUPPRESS_THRESHOLD: u32 = 27;
 
 type Cell = (i32, i32);
 
@@ -49,6 +49,22 @@ impl ClutterMap {
             history: VecDeque::with_capacity(WINDOW_SWEEPS + 1),
             counts: HashMap::new(),
         }
+    }
+
+    /// Returns true if `cell` or any of its 8 neighbours is above the
+    /// suppression threshold.  The dilation catches turbine/land returns
+    /// that jitter ±1 cell between sweeps due to blade rotation or ranging
+    /// noise, preventing them from accumulating cleanly in a single cell.
+    fn is_suppressed(&self, cell: Cell) -> bool {
+        for dlat in [-1i32, 0, 1] {
+            for dlon in [-1i32, 0, 1] {
+                let c = (cell.0 + dlat, cell.1 + dlon);
+                if self.counts.get(&c).copied().unwrap_or(0) >= SUPPRESS_THRESHOLD {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Feed one sweep's `(lat, lon)` detections; returns those that are not
@@ -78,15 +94,10 @@ impl ClutterMap {
         }
         self.history.push_back(current);
 
-        // Return detections whose cell count is below the suppression threshold.
+        // Return detections whose cell (and none of its 8 neighbours) is
+        // above the suppression threshold.
         dets.iter()
-            .filter(|&&(la, lo)| {
-                self.counts
-                    .get(&to_cell(la, lo))
-                    .copied()
-                    .unwrap_or(0)
-                    < SUPPRESS_THRESHOLD
-            })
+            .filter(|&&(la, lo)| !self.is_suppressed(to_cell(la, lo)))
             .copied()
             .collect()
     }
