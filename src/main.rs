@@ -44,6 +44,13 @@ struct Args {
     #[arg(long, default_value_t = DEFAULT_SPOKES_PER_REV)]
     spokes: u32,
 
+    /// Seconds to wait before making the first WebSocket connection attempt.
+    /// Use this when mayara needs time to discover the radar after startup —
+    /// connecting too early can trigger a stack overflow in mayara's replay mode.
+    /// On a real vessel with a live radar this is not needed.
+    #[arg(long, default_value_t = 0)]
+    connect_delay: u64,
+
     /// Flush all active tracks and reconnect if no spoke data arrives for this
     /// many seconds.  Useful when a radar goes unexpectedly silent — partial
     /// tracks are uploaded rather than lost.  0 = disabled (default).
@@ -84,6 +91,11 @@ async fn main() -> Result<()> {
     };
 
     let mut state = ProcessState::new(args.spokes, args.land_filter);
+
+    if args.connect_delay > 0 {
+        log::info!("waiting {}s before connecting (--connect-delay)", args.connect_delay);
+        tokio::time::sleep(tokio::time::Duration::from_secs(args.connect_delay)).await;
+    }
 
     if let Some(ref url) = args.ws_url {
         run_websocket(&mut state, url, &mut uploader, args.spoke_timeout).await?;
