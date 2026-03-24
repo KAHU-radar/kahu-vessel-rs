@@ -70,6 +70,13 @@ struct Args {
     /// Use when piping: mayara --output ... | kahu-daemon --stdin
     #[arg(long, default_value_t = false)]
     stdin: bool,
+
+    /// Seconds to wait on startup before connecting to mayara's WebSocket.
+    /// Gives mayara time to discover the radar before the first connection
+    /// attempt.  Only applied once at startup; reconnect retries are not
+    /// affected.
+    #[arg(long, default_value_t = 10)]
+    startup_delay: u64,
 }
 
 #[tokio::main]
@@ -86,6 +93,10 @@ async fn main() -> Result<()> {
     let mut state = ProcessState::new(args.spokes, args.land_filter);
 
     if let Some(ref url) = args.ws_url {
+        if args.startup_delay > 0 {
+            println!("Waiting {}s for mayara to initialise...", args.startup_delay);
+            tokio::time::sleep(tokio::time::Duration::from_secs(args.startup_delay)).await;
+        }
         run_websocket(&mut state, url, &mut uploader, args.spoke_timeout).await?;
     } else {
         // Default: read from stdin (length-prefixed frames written by mayara --output
