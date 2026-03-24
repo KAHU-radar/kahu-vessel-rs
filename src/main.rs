@@ -15,7 +15,7 @@ use tokio_tungstenite::{connect_async, tungstenite::protocol::Message as WsMessa
 
 use clutter::ClutterMap;
 use protos::RadarMessage::RadarMessage;
-use tracker::{Tracker, MIN_FIXES};
+use tracker::Tracker;
 use upload::{TrackPoint, UploadTrack, Uploader};
 
 /// Spokes per full revolution — HALO radar default.  Override with --spokes.
@@ -71,6 +71,12 @@ struct Args {
     #[arg(long, default_value_t = false)]
     stdin: bool,
 
+    /// Minimum number of fixes a track must have before it is uploaded.
+    /// Lower values let short pcap captures produce uploadable tracks.
+    /// Default 3 is appropriate for real continuous radar data.
+    #[arg(long, default_value_t = 3)]
+    min_fixes: usize,
+
     /// Seconds to wait on startup before connecting to mayara's WebSocket.
     /// Gives mayara time to discover the radar before the first connection
     /// attempt.  Only applied once at startup; reconnect retries are not
@@ -92,23 +98,25 @@ async fn main() -> Result<()> {
 
     let mut state = ProcessState::new(args.spokes, args.land_filter);
 
+    let min_fixes = args.min_fixes;
+
     if let Some(ref url) = args.ws_url {
         if args.startup_delay > 0 {
             println!("Waiting {}s for mayara to initialise...", args.startup_delay);
             tokio::time::sleep(tokio::time::Duration::from_secs(args.startup_delay)).await;
         }
-        run_websocket(&mut state, url, &mut uploader, args.spoke_timeout).await?;
+        run_websocket(&mut state, url, &mut uploader, args.spoke_timeout, min_fixes).await?;
     } else {
         // Default: read from stdin (length-prefixed frames written by mayara --output
         // after the framing fix, or piped via --stdin flag).
-        run_stdin(&mut state, &mut uploader).await?;
+        run_stdin(&mut state, &mut uploader, min_fixes).await?;
     }
 
     // Flush all remaining active tracks on clean exit.
     let all = state.tracker.drain();
     log::info!("flushing {} remaining tracks", all.len());
     for track in all {
-        flush_track(track, &mut uploader);
+        flush_track(track, &mut uploader, min_fixes);
     }
 
     Ok(())
@@ -239,6 +247,7 @@ async fn run_websocket(
     url: &str,
     uploader: &mut Option<Uploader>,
     spoke_timeout: u64,
+    min_fixes: usize,
 ) -> Result<()> {
     // Spawn a task that watches for Ctrl-C and signals the watch channel.
     // All select! arms below subscribe to this channel so shutdown interrupts
@@ -289,7 +298,7 @@ async fn run_websocket(
                                     }
                                     let tracks = state.process_bytes(&data);
                                     for track in tracks {
-                                        flush_track(track, uploader);
+                                        flush_track(track, uploader, min_fixes);
                                     }
                                 }
                                 Some(Ok(WsMessage::Close(_))) | None => {
@@ -308,7 +317,7 @@ async fn run_websocket(
                             let stale = state.tracker.drain();
                             log::info!("flushing {} stale tracks", stale.len());
                             for track in stale {
-                                flush_track(track, uploader);
+                                flush_track(track, uploader, min_fixes);
                             }
                             break; // triggers reconnect; fresh tracker state
                         }
@@ -343,7 +352,7 @@ async fn run_websocket(
 // Stdin input — length-prefixed frames: [u32 LE length][protobuf bytes]
 // ---------------------------------------------------------------------------
 
-async fn run_stdin(state: &mut ProcessState, uploader: &mut Option<Uploader>) -> Result<()> {
+async fn run_stdin(state: &mut ProcessState, uploader: &mut Option<Uploader>, min_fixes: usize) -> Result<()> {
     log::info!("reading mayara protobuf stream from stdin (length-prefixed)");
 
     let mut reader = BufReader::new(tokio::io::stdin());
@@ -373,7 +382,7 @@ async fn run_stdin(state: &mut ProcessState, uploader: &mut Option<Uploader>) ->
 
         let tracks = state.process_bytes(&msg_buf);
         for track in tracks {
-            flush_track(track, uploader);
+            flush_track(track, uploader, min_fixes);
         }
     }
 
@@ -384,8 +393,8 @@ async fn run_stdin(state: &mut ProcessState, uploader: &mut Option<Uploader>) ->
 // Track flushing — shared by both input paths
 // ---------------------------------------------------------------------------
 
-fn flush_track(track: tracker::Track, uploader: &mut Option<Uploader>) {
-    if track.fixes.len() < MIN_FIXES {
+fn flush_track(track: tracker::Track, uploader: &mut Option<Uploader>, min_fixes: usize) {
+    if track.fixes.len() < min_fixes {
         log::debug!(
             "dropping track {} ({} fixes)",
             &track.id.to_string()[..8],
