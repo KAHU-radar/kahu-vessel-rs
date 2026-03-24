@@ -1,4 +1,3 @@
-mod cluster;
 mod clutter;
 mod detect;
 mod geo;
@@ -220,13 +219,7 @@ impl ProcessState {
                 } else {
                     self.sweep_dets.clone()
                 };
-                let clustered = cluster::cluster(&filtered);
-                log::debug!(
-                    "cluster: {}/{} dets after merge",
-                    clustered.len(),
-                    filtered.len()
-                );
-                let lost = self.tracker.update(&clustered, ts);
+                let lost = self.tracker.update(&filtered, ts);
                 log::debug!(
                     "sweep: {} detections, {} active tracks, {} flushed",
                     filtered.len(),
