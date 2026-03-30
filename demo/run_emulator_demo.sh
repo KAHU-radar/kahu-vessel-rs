@@ -5,22 +5,24 @@
 #   ./demo/run_emulator_demo.sh [--dry-run] [--land-filter]
 #
 # Requirements:
-#   - mayara-server binary in PATH (or at ~/mayara-server/target/release/mayara-server)
-#   - kahu-daemon binary in PATH (or at ~/kahu-vessel-rs/target/release/kahu-daemon)
-#   - KAHU_API_KEY env var set (or pass --api-key below)
+#   - mayara-server built at ~/mayara-server/target/release/mayara-server
+#     (or set MAYARA_BIN=/path/to/mayara-server)
+#   - kahu-daemon built at ~/kahu-vessel-rs/target/release/kahu-daemon
+#     (or set DAEMON_BIN=/path/to/kahu-daemon)
+#   - KAHU_API_KEY env var set
 #
 # Background:
-#   mayara's WebSocket spoke stream uses a broadcast channel with a fixed buffer
-#   (capacity 32, ~1.3 s of spokes at 25 Hz).  If mayara has been running for
-#   more than ~1 second without any client, the buffer fills and new subscribers
-#   immediately receive a Lagged error, causing the stream to close silently.
-#   This script kills any running mayara instance and starts both services fresh
-#   to guarantee clean delivery from spoke 0.
+#   mayara's WebSocket spoke stream uses a broadcast channel (capacity 32,
+#   ~1.3 s of spokes at 25 Hz).  If mayara has been running for more than
+#   ~1 second without any WebSocket client, the buffer fills and new
+#   subscribers immediately receive a Lagged error, silently closing the
+#   stream.  This script always kills any running mayara first and connects
+#   kahu-daemon as quickly as possible after startup to beat the buffer fill.
 
-set -euo pipefail
+set -uo pipefail
 
 # ---------------------------------------------------------------------------
-# Configurable defaults
+# Configurable defaults — prefer locally-built binaries over PATH
 # ---------------------------------------------------------------------------
 MAYARA_BIN="${MAYARA_BIN:-}"
 DAEMON_BIN="${DAEMON_BIN:-}"
@@ -28,7 +30,6 @@ UPLOAD_HOST="${UPLOAD_HOST:-crowdsource.kahu.earth}"
 UPLOAD_PORT="${UPLOAD_PORT:-9900}"
 API_KEY="${KAHU_API_KEY:-}"
 SPOKES_PER_REV=2048
-STARTUP_DELAY=3    # seconds to wait after mayara starts before connecting
 
 # Parse flags forwarded to kahu-daemon
 DAEMON_EXTRA_FLAGS=()
@@ -37,33 +38,37 @@ for arg in "$@"; do
 done
 
 # ---------------------------------------------------------------------------
-# Resolve binaries
+# Resolve binaries — local release build takes priority over PATH
 # ---------------------------------------------------------------------------
-find_bin() {
-    local name="$1"
-    local fallback="$2"
-    if command -v "$name" &>/dev/null; then
-        echo "$name"
-    elif [[ -x "$fallback" ]]; then
-        echo "$fallback"
+resolve_bin() {
+    local local_path="$1"
+    local path_name="$2"
+    if [[ -x "$local_path" ]]; then
+        echo "$local_path"
+    elif command -v "$path_name" &>/dev/null; then
+        echo "$path_name"
     else
         echo ""
     fi
 }
 
 if [[ -z "$MAYARA_BIN" ]]; then
-    MAYARA_BIN="$(find_bin mayara-server "$HOME/mayara-server/target/release/mayara-server")"
+    MAYARA_BIN="$(resolve_bin "$HOME/mayara-server/target/release/mayara-server" mayara-server)"
 fi
 if [[ -z "$DAEMON_BIN" ]]; then
-    DAEMON_BIN="$(find_bin kahu-daemon "$HOME/kahu-vessel-rs/target/release/kahu-daemon")"
+    DAEMON_BIN="$(resolve_bin "$HOME/kahu-vessel-rs/target/release/kahu-daemon" kahu-daemon)"
 fi
 
 if [[ -z "$MAYARA_BIN" ]]; then
-    echo "ERROR: mayara-server not found. Install it or set MAYARA_BIN=/path/to/mayara-server"
+    echo "ERROR: mayara-server not found."
+    echo "  Build it: cd ~/mayara-server && cargo build --release"
+    echo "  Or set:   MAYARA_BIN=/path/to/mayara-server"
     exit 1
 fi
 if [[ -z "$DAEMON_BIN" ]]; then
-    echo "ERROR: kahu-daemon not found. Build with 'cargo build --release' or set DAEMON_BIN=/path/to/kahu-daemon"
+    echo "ERROR: kahu-daemon not found."
+    echo "  Build it: cd ~/kahu-vessel-rs && cargo build --release"
+    echo "  Or set:   DAEMON_BIN=/path/to/kahu-daemon"
     exit 1
 fi
 
@@ -97,8 +102,9 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # ---------------------------------------------------------------------------
-# Wait for mayara to expose the emulator radar via its HTTP API.
-# The emulator radar appears as 'emu0001' once the server is ready.
+# Wait for mayara to expose the emulator radar via its HTTP API, then connect
+# kahu-daemon immediately — before the broadcast ring buffer fills (~1.3 s).
+# Do NOT add an extra sleep here; connect as soon as the radar is visible.
 # ---------------------------------------------------------------------------
 echo "Waiting for emulator radar to appear..."
 RADAR_URL="http://localhost:6502/signalk/v2/api/vessels/self/radars"
@@ -107,7 +113,7 @@ MAX_WAIT=30
 ELAPSED=0
 while true; do
     if curl -sf "$RADAR_URL" 2>/dev/null | grep -q "emu0001"; then
-        echo "Emulator radar ready."
+        echo "Emulator radar ready — connecting immediately."
         break
     fi
     if (( ELAPSED >= MAX_WAIT )); then
@@ -118,12 +124,6 @@ while true; do
     (( ELAPSED++ ))
 done
 
-# Small additional pause so the broadcast channel starts filling before we
-# subscribe — this is intentional: we want our subscription to land before
-# the buffer wraps for the first time.
-echo "Waiting ${STARTUP_DELAY}s for spoke stream to stabilise..."
-sleep "$STARTUP_DELAY"
-
 # ---------------------------------------------------------------------------
 # Start kahu-daemon
 # ---------------------------------------------------------------------------
@@ -132,7 +132,7 @@ DAEMON_ARGS=(
     --upload-host "$UPLOAD_HOST"
     --upload-port "$UPLOAD_PORT"
     --spokes "$SPOKES_PER_REV"
-    --startup-delay 0   # we handled the delay above
+    --startup-delay 0   # mayara is already ready; no extra delay needed
 )
 if [[ -n "$API_KEY" ]]; then
     DAEMON_ARGS+=(--api-key "$API_KEY")
@@ -141,4 +141,4 @@ DAEMON_ARGS+=("${DAEMON_EXTRA_FLAGS[@]}")
 
 echo "Starting kahu-daemon..."
 echo "  $DAEMON_BIN ${DAEMON_ARGS[*]}"
-RUST_MIN_STACK=8388608 "$DAEMON_BIN" "${DAEMON_ARGS[@]}"
+RUST_MIN_STACK=8388608 "$DAEMON_BIN" "${DAEMON_ARGS[@]}" || true
