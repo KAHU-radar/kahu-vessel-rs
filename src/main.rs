@@ -199,9 +199,6 @@ impl ProcessState {
             }
 
             // Detect a new revolution: angle wraps around or drops significantly.
-            if spoke.angle % 512 == 0 {
-                log::info!("milestone: spoke.angle={} prev={:?}", spoke.angle, self.prev_angle);
-            }
             let new_rev = self
                 .prev_angle
                 .map(|prev| spoke.angle < prev && prev > self.spokes_per_rev / 2)
@@ -209,7 +206,6 @@ impl ProcessState {
             self.prev_angle = Some(spoke.angle);
 
             if new_rev {
-                log::info!("revolution: prev_angle={:?} current={}", self.prev_angle, spoke.angle);
                 let ts = Utc::now();
                 let filtered: Vec<(f64, f64)> = if let Some(ref mut cm) = self.clutter {
                     let f = cm.filter(&self.sweep_dets);
