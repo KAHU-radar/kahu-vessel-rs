@@ -76,10 +76,13 @@ echo "mayara:  $MAYARA_BIN"
 echo "daemon:  $DAEMON_BIN"
 
 # ---------------------------------------------------------------------------
-# Kill any running mayara so we start fresh (avoids the broadcast-lag bug).
+# Kill any running mayara / kahu-daemon so we start fresh.
+# Stale kahu-daemon instances from previous runs keep retrying against the
+# new mayara and show as spurious 500 errors in the mayara log.
 # ---------------------------------------------------------------------------
-echo "Stopping any existing mayara-server instances..."
+echo "Stopping any existing mayara-server / kahu-daemon instances..."
 pkill -x mayara-server 2>/dev/null || true
+pkill -x kahu-daemon   2>/dev/null || true
 sleep 1
 
 # ---------------------------------------------------------------------------
@@ -152,4 +155,4 @@ DAEMON_ARGS+=("${DAEMON_EXTRA_FLAGS[@]}")
 
 echo "Starting kahu-daemon..."
 echo "  $DAEMON_BIN ${DAEMON_ARGS[*]}"
-RUST_MIN_STACK=8388608 "$DAEMON_BIN" "${DAEMON_ARGS[@]}" || true
+RUST_LOG=info RUST_MIN_STACK=8388608 "$DAEMON_BIN" "${DAEMON_ARGS[@]}" || true
