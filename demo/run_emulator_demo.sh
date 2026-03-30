@@ -11,13 +11,10 @@
 #     (or set DAEMON_BIN=/path/to/kahu-daemon)
 #   - KAHU_API_KEY env var set
 #
-# Background:
-#   mayara's WebSocket spoke stream uses a broadcast channel (capacity 32,
-#   ~1.3 s of spokes at 25 Hz).  If mayara has been running for more than
-#   ~1 second without any WebSocket client, the buffer fills and new
-#   subscribers immediately receive a Lagged error, silently closing the
-#   stream.  This script always kills any running mayara first and connects
-#   kahu-daemon as quickly as possible after startup to beat the buffer fill.
+# Startup order (avoids mayara's broadcast-channel buffer-full / Lagged issue):
+#   1. Start mayara emulator (radar in Standby — no spokes yet)
+#   2. Connect kahu-daemon (subscribes to an empty channel, waits)
+#   3. Set radar to Transmit (spokes start flowing into the waiting subscriber)
 
 set -uo pipefail
 
@@ -77,8 +74,6 @@ echo "daemon:  $DAEMON_BIN"
 
 # ---------------------------------------------------------------------------
 # Kill any running mayara / kahu-daemon so we start fresh.
-# Stale kahu-daemon instances from previous runs keep retrying against the
-# new mayara and show as spurious 500 errors in the mayara log.
 # ---------------------------------------------------------------------------
 echo "Stopping any existing mayara-server / kahu-daemon instances..."
 pkill -x mayara-server 2>/dev/null || true
@@ -86,7 +81,7 @@ pkill -x kahu-daemon   2>/dev/null || true
 sleep 1
 
 # ---------------------------------------------------------------------------
-# Start mayara emulator
+# Start mayara emulator (radar starts in Standby — no spokes yet)
 # ---------------------------------------------------------------------------
 echo "Starting mayara emulator..."
 RUST_MIN_STACK=8388608 "$MAYARA_BIN" \
@@ -96,18 +91,19 @@ RUST_MIN_STACK=8388608 "$MAYARA_BIN" \
 MAYARA_PID=$!
 echo "mayara PID: $MAYARA_PID"
 
-# Trap to kill mayara when this script exits.
+DAEMON_PID=""
+
+# Trap to kill both processes on exit / Ctrl-C.
 cleanup() {
     echo ""
-    echo "Shutting down mayara (PID $MAYARA_PID)..."
+    echo "Shutting down..."
+    [[ -n "$DAEMON_PID" ]] && kill "$DAEMON_PID" 2>/dev/null || true
     kill "$MAYARA_PID" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
 # ---------------------------------------------------------------------------
-# Wait for mayara to expose the emulator radar via its HTTP API, then connect
-# kahu-daemon immediately — before the broadcast ring buffer fills (~1.3 s).
-# Do NOT add an extra sleep here; connect as soon as the radar is visible.
+# Wait for mayara to expose the emulator radar.
 # ---------------------------------------------------------------------------
 echo "Waiting for emulator radar to appear..."
 RADAR_URL="http://localhost:6502/signalk/v2/api/vessels/self/radars"
@@ -117,42 +113,49 @@ MAX_WAIT=30
 ELAPSED=0
 while true; do
     if curl -sf "$RADAR_URL" 2>/dev/null | grep -q "emu0001"; then
-        echo "Emulator radar ready."
+        echo "Emulator radar ready (Standby)."
         break
     fi
     if (( ELAPSED >= MAX_WAIT )); then
-        echo "ERROR: mayara did not expose emu0001 within ${MAX_WAIT}s. Check mayara output."
+        echo "ERROR: mayara did not expose emu0001 within ${MAX_WAIT}s."
         exit 1
     fi
     sleep 1
     (( ELAPSED++ ))
 done
 
-# Set the radar to Transmit (value=2; 1=Standby).
-# The emulator starts in Standby; the spokes WebSocket returns 500 until transmitting.
-echo "Setting radar to Transmit..."
-curl -sf -X PUT "$POWER_URL" \
-    -H "Content-Type: application/json" \
-    -d '{"value": 2}' >/dev/null \
-    || echo "WARNING: failed to set radar to transmit — spoke stream may return 500"
-# Brief pause for mayara to start generating spokes before we subscribe.
-sleep 1
-
 # ---------------------------------------------------------------------------
-# Start kahu-daemon
+# Start kahu-daemon in the background BEFORE enabling transmit.
+# It subscribes to an empty broadcast channel and waits — no Lagged issue.
 # ---------------------------------------------------------------------------
 DAEMON_ARGS=(
     --ws-url "$SPOKE_URL"
     --upload-host "$UPLOAD_HOST"
     --upload-port "$UPLOAD_PORT"
     --spokes "$SPOKES_PER_REV"
-    --startup-delay 0   # mayara is already ready; no extra delay needed
+    --startup-delay 0
 )
 if [[ -n "$API_KEY" ]]; then
     DAEMON_ARGS+=(--api-key "$API_KEY")
 fi
 DAEMON_ARGS+=("${DAEMON_EXTRA_FLAGS[@]}")
 
-echo "Starting kahu-daemon..."
+echo "Starting kahu-daemon (waiting for spokes)..."
 echo "  $DAEMON_BIN ${DAEMON_ARGS[*]}"
-RUST_LOG=info RUST_MIN_STACK=8388608 "$DAEMON_BIN" "${DAEMON_ARGS[@]}" || true
+RUST_LOG=info RUST_MIN_STACK=8388608 "$DAEMON_BIN" "${DAEMON_ARGS[@]}" &
+DAEMON_PID=$!
+
+# Give kahu-daemon time to connect and subscribe before we start transmitting.
+sleep 2
+
+# ---------------------------------------------------------------------------
+# Now enable Transmit — spokes flow directly into the subscribed kahu-daemon.
+# ---------------------------------------------------------------------------
+echo "Setting radar to Transmit..."
+curl -sf -X PUT "$POWER_URL" \
+    -H "Content-Type: application/json" \
+    -d '{"value": 2}' >/dev/null \
+    || echo "WARNING: failed to set radar to transmit"
+
+echo "Pipeline running. Press Ctrl-C to stop."
+wait "$DAEMON_PID"
