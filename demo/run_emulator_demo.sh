@@ -108,12 +108,13 @@ trap cleanup EXIT INT TERM
 # ---------------------------------------------------------------------------
 echo "Waiting for emulator radar to appear..."
 RADAR_URL="http://localhost:6502/signalk/v2/api/vessels/self/radars"
+POWER_URL="http://localhost:6502/signalk/v2/api/vessels/self/radars/emu0001/controls/power"
 SPOKE_URL="ws://localhost:6502/signalk/v2/api/vessels/self/radars/emu0001/spokes"
 MAX_WAIT=30
 ELAPSED=0
 while true; do
     if curl -sf "$RADAR_URL" 2>/dev/null | grep -q "emu0001"; then
-        echo "Emulator radar ready — connecting immediately."
+        echo "Emulator radar ready."
         break
     fi
     if (( ELAPSED >= MAX_WAIT )); then
@@ -123,6 +124,16 @@ while true; do
     sleep 1
     (( ELAPSED++ ))
 done
+
+# Set the radar to Transmit (value=2; 1=Standby).
+# The emulator starts in Standby; the spokes WebSocket returns 500 until transmitting.
+echo "Setting radar to Transmit..."
+curl -sf -X PUT "$POWER_URL" \
+    -H "Content-Type: application/json" \
+    -d '{"value": 2}' >/dev/null \
+    || echo "WARNING: failed to set radar to transmit — spoke stream may return 500"
+# Brief pause for mayara to start generating spokes before we subscribe.
+sleep 1
 
 # ---------------------------------------------------------------------------
 # Start kahu-daemon
