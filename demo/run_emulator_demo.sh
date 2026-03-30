@@ -13,8 +13,12 @@
 #
 # Startup order (avoids mayara's broadcast-channel buffer-full / Lagged issue):
 #   1. Start mayara emulator (radar in Standby — no spokes yet)
-#   2. Connect kahu-daemon (subscribes to an empty channel, waits)
-#   3. Set radar to Transmit (spokes start flowing into the waiting subscriber)
+#   2. Set radar to Transmit (spokes start flowing)
+#   3. Connect kahu-daemon (subscribes to active channel)
+#
+# Note: mayara has a local aarch64 patch applied at ~/mayara-server that
+# handles RecvError::Lagged gracefully (resume instead of closing the stream).
+# Without that patch the WebSocket silently disconnects every ~60 s.
 
 set -uo pipefail
 
@@ -81,7 +85,7 @@ pkill -x kahu-daemon   2>/dev/null || true
 sleep 1
 
 # ---------------------------------------------------------------------------
-# Start mayara emulator (radar starts in Standby — no spokes yet)
+# Start mayara emulator
 # ---------------------------------------------------------------------------
 echo "Starting mayara emulator..."
 RUST_MIN_STACK=8388608 "$MAYARA_BIN" \
@@ -93,7 +97,6 @@ echo "mayara PID: $MAYARA_PID"
 
 DAEMON_PID=""
 
-# Trap to kill both processes on exit / Ctrl-C.
 cleanup() {
     echo ""
     echo "Shutting down..."
@@ -113,7 +116,7 @@ MAX_WAIT=30
 ELAPSED=0
 while true; do
     if curl -sf "$RADAR_URL" 2>/dev/null | grep -q "emu0001"; then
-        echo "Emulator radar ready (Standby)."
+        echo "Emulator radar ready."
         break
     fi
     if (( ELAPSED >= MAX_WAIT )); then
@@ -125,8 +128,21 @@ while true; do
 done
 
 # ---------------------------------------------------------------------------
-# Start kahu-daemon in the background BEFORE enabling transmit.
-# It subscribes to an empty broadcast channel and waits — no Lagged issue.
+# Set radar to Transmit before connecting kahu-daemon.
+# Wait for "Starting transmission" to confirm spokes are flowing.
+# ---------------------------------------------------------------------------
+echo "Setting radar to Transmit..."
+curl -sf -X PUT "$POWER_URL" \
+    -H "Content-Type: application/json" \
+    -d '{"value": 2}' >/dev/null \
+    || echo "WARNING: failed to set radar to transmit"
+
+# Give the emulator a moment to start generating spokes.
+sleep 3
+
+# ---------------------------------------------------------------------------
+# Start kahu-daemon — subscribes to an already-running spoke stream.
+# With the Lagged fix in mayara, it will resume cleanly if it falls behind.
 # ---------------------------------------------------------------------------
 DAEMON_ARGS=(
     --ws-url "$SPOKE_URL"
@@ -140,22 +156,10 @@ if [[ -n "$API_KEY" ]]; then
 fi
 DAEMON_ARGS+=("${DAEMON_EXTRA_FLAGS[@]}")
 
-echo "Starting kahu-daemon (waiting for spokes)..."
+echo "Starting kahu-daemon..."
 echo "  $DAEMON_BIN ${DAEMON_ARGS[*]}"
 RUST_LOG=info RUST_MIN_STACK=8388608 "$DAEMON_BIN" "${DAEMON_ARGS[@]}" &
 DAEMON_PID=$!
-
-# Give kahu-daemon time to connect and subscribe before we start transmitting.
-sleep 2
-
-# ---------------------------------------------------------------------------
-# Now enable Transmit — spokes flow directly into the subscribed kahu-daemon.
-# ---------------------------------------------------------------------------
-echo "Setting radar to Transmit..."
-curl -sf -X PUT "$POWER_URL" \
-    -H "Content-Type: application/json" \
-    -d '{"value": 2}' >/dev/null \
-    || echo "WARNING: failed to set radar to transmit"
 
 echo "Pipeline running. Press Ctrl-C to stop."
 wait "$DAEMON_PID"
