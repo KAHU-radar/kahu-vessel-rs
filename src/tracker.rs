@@ -18,9 +18,6 @@ const GATE_M: f64 = 200.0;
 /// Number of consecutive sweeps a track can go unupdated before it is lost.
 const MAX_MISSED_SWEEPS: u32 = 8;
 
-/// Minimum fixes required before a track is worth uploading.
-pub const MIN_FIXES: usize = 3;
-
 /// Segment a track once it reaches this many fixes, even if still active.
 /// Prevents unbounded memory growth and enables regular uploads during long
 /// radar sessions. At ~1 Hz sweep rate, 20 = first upload within ~20 s.

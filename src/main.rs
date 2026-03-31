@@ -18,6 +18,14 @@ use protos::RadarMessage::RadarMessage;
 use tracker::Tracker;
 use upload::{TrackPoint, UploadTrack, Uploader};
 
+/// Merge nearby detections into cluster centroids before tracking.
+///
+/// Each physical target typically spans ~20–40 spokes, producing one
+/// detection per spoke.  Without clustering these all birth separate tracks
+/// and cause O(n²) tracker work that overloads the Pi.  Any pair of
+/// detections within CLUSTER_RADIUS_M is merged into a single centroid.
+const CLUSTER_RADIUS_M: f64 = 60.0;
+
 /// Spokes per full revolution — HALO radar default.  Override with --spokes.
 const DEFAULT_SPOKES_PER_REV: u32 = 2048;
 
@@ -120,6 +128,40 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Detection clustering — merge per-spoke blobs from the same physical target
+// ---------------------------------------------------------------------------
+
+/// Spatially cluster `(lat, lon)` detections; returns one centroid per group.
+///
+/// Uses a greedy single-pass algorithm: each detection is merged into the
+/// first existing cluster whose centroid is within `radius_m`, otherwise it
+/// seeds a new cluster.  Order-dependent but fast and good enough for blobs
+/// that are already spatially contiguous along the spoke axis.
+fn cluster_detections(dets: &[(f64, f64)], radius_m: f64) -> Vec<(f64, f64)> {
+    // (lat_sum, lon_sum, count)
+    let mut clusters: Vec<(f64, f64, u32)> = Vec::new();
+
+    'outer: for &(lat, lon) in dets {
+        for (lat_sum, lon_sum, count) in &mut clusters {
+            let clat = *lat_sum / *count as f64;
+            let clon = *lon_sum / *count as f64;
+            if geo::haversine_m(clat, clon, lat, lon) < radius_m {
+                *lat_sum += lat;
+                *lon_sum += lon;
+                *count += 1;
+                continue 'outer;
+            }
+        }
+        clusters.push((lat, lon, 1));
+    }
+
+    clusters
+        .iter()
+        .map(|&(ls, lo, c)| (ls / c as f64, lo / c as f64))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -249,10 +291,12 @@ impl ProcessState {
                 } else {
                     self.sweep_dets.clone()
                 };
-                let lost = self.tracker.update(&filtered, ts);
+                let clustered = cluster_detections(&filtered, CLUSTER_RADIUS_M);
+                let lost = self.tracker.update(&clustered, ts);
                 log::debug!(
-                    "sweep: {} detections, {} active tracks, {} flushed",
+                    "sweep: {} dets → {} clusters, {} active tracks, {} flushed",
                     filtered.len(),
+                    clustered.len(),
                     self.tracker.active_count(),
                     lost.len()
                 );
