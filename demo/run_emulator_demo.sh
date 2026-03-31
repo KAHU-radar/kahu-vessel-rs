@@ -12,9 +12,16 @@
 #   - KAHU_API_KEY env var set
 #
 # Startup order (avoids mayara's broadcast-channel buffer-full / Lagged issue):
-#   1. Start mayara emulator (radar in Standby — no spokes yet)
-#   2. Set radar to Transmit (spokes start flowing)
-#   3. Connect kahu-daemon (subscribes to active channel)
+#   1. Start mayara emulator (emulator auto-starts in Transmit)
+#   2. Immediately set radar to Standby to drain the spoke channel
+#   3. Start kahu-daemon (connects and subscribes to the now-empty channel)
+#   4. Set radar to Transmit — kahu-daemon is already subscribed, no Lagged
+#
+# Why this matters: mayara's spoke broadcast channel holds ~1.3 s of frames.
+# If kahu-daemon subscribes after the channel fills, the first recv() returns
+# RecvError::Lagged, dropping frames and delaying the first revolution
+# detection.  By subscribing while the channel is empty (Standby) and then
+# enabling Transmit, the daemon catches spokes from the very first frame.
 #
 # Note: mayara has a local aarch64 patch applied at ~/mayara-server that
 # handles RecvError::Lagged gracefully (resume instead of closing the stream).
@@ -128,21 +135,19 @@ while true; do
 done
 
 # ---------------------------------------------------------------------------
-# Set radar to Transmit before connecting kahu-daemon.
-# Wait for "Starting transmission" to confirm spokes are flowing.
+# Put radar to Standby so the broadcast channel drains before kahu-daemon
+# subscribes.  The emulator auto-starts in Transmit, so without this step
+# the channel fills in ~1.3 s and the daemon's first recv() returns Lagged.
 # ---------------------------------------------------------------------------
-echo "Setting radar to Transmit..."
+echo "Setting radar to Standby (draining spoke channel)..."
 curl -sf -X PUT "$POWER_URL" \
     -H "Content-Type: application/json" \
-    -d '{"value": 2}' >/dev/null \
-    || echo "WARNING: failed to set radar to transmit"
-
-# Give the emulator a moment to start generating spokes.
-sleep 3
+    -d '{"value": 1}' >/dev/null \
+    || echo "WARNING: failed to set radar to standby"
 
 # ---------------------------------------------------------------------------
-# Start kahu-daemon — subscribes to an already-running spoke stream.
-# With the Lagged fix in mayara, it will resume cleanly if it falls behind.
+# Start kahu-daemon — connects while channel is empty (Standby).
+# It subscribes before any spokes are sent, guaranteeing no initial Lagged.
 # ---------------------------------------------------------------------------
 DAEMON_ARGS=(
     --ws-url "$SPOKE_URL"
@@ -160,6 +165,19 @@ echo "Starting kahu-daemon..."
 echo "  $DAEMON_BIN ${DAEMON_ARGS[*]}"
 RUST_LOG=info RUST_MIN_STACK=8388608 "$DAEMON_BIN" "${DAEMON_ARGS[@]}" &
 DAEMON_PID=$!
+
+# Give kahu-daemon time to establish the WebSocket connection.
+sleep 5
+
+# ---------------------------------------------------------------------------
+# Set radar to Transmit — kahu-daemon is already subscribed, so it receives
+# spokes from the very first frame with no Lagged.
+# ---------------------------------------------------------------------------
+echo "Setting radar to Transmit..."
+curl -sf -X PUT "$POWER_URL" \
+    -H "Content-Type: application/json" \
+    -d '{"value": 2}' >/dev/null \
+    || echo "WARNING: failed to set radar to transmit"
 
 echo "Pipeline running. Press Ctrl-C to stop."
 wait "$DAEMON_PID"
