@@ -198,10 +198,19 @@ impl ProcessState {
                 self.sweep_dets.push((lat, lon));
             }
 
-            // Detect a new revolution: angle wraps around or drops significantly.
+            // Detect a new revolution: angle wraps from the last eighth (>7/8) to
+            // the first eighth (<1/8) of the revolution.  The tighter window rejects
+            // backward jumps caused by mayara's broadcast RecvError::Lagged, which
+            // advance the receiver by ~1024 spokes (half revolution).  A genuine
+            // 2047→0 wrap always satisfies both conditions; a Lagged jump of 1024
+            // spokes cannot — it would require prev > 7/8*N and new = prev-1024 < N/8,
+            // which is only possible if prev < N/8 + 1024 < 7/8*N (contradiction).
             let new_rev = self
                 .prev_angle
-                .map(|prev| spoke.angle < prev && prev > self.spokes_per_rev / 2)
+                .map(|prev| {
+                    spoke.angle < self.spokes_per_rev / 8
+                        && prev > self.spokes_per_rev * 7 / 8
+                })
                 .unwrap_or(false);
             self.prev_angle = Some(spoke.angle);
 
