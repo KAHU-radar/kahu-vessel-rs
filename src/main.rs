@@ -131,6 +131,10 @@ struct ProcessState {
     clutter: Option<ClutterMap>,
     sweep_dets: Vec<(f64, f64)>,
     prev_angle: Option<u32>,
+    /// Cumulative forward-angle progress since the last revolution was fired.
+    /// Incremented on each forward step; reset to zero on any backward jump
+    /// (regardless of whether the jump fires a revolution).
+    angle_since_last_rev: u32,
     own_pos: Option<(f64, f64)>,
     spokes_per_rev: u32,
 }
@@ -142,6 +146,7 @@ impl ProcessState {
             clutter: land_filter.then(ClutterMap::new),
             sweep_dets: Vec::new(),
             prev_angle: None,
+            angle_since_last_rev: 0,
             own_pos: None,
             spokes_per_rev,
         }
@@ -198,20 +203,36 @@ impl ProcessState {
                 self.sweep_dets.push((lat, lon));
             }
 
-            // Detect a new revolution: angle wraps from the last eighth (>7/8) to
-            // the first eighth (<1/8) of the revolution.  The tighter window rejects
-            // backward jumps caused by mayara's broadcast RecvError::Lagged, which
-            // advance the receiver by ~1024 spokes (half revolution).  A genuine
-            // 2047→0 wrap always satisfies both conditions; a Lagged jump of 1024
-            // spokes cannot — it would require prev > 7/8*N and new = prev-1024 < N/8,
-            // which is only possible if prev < N/8 + 1024 < 7/8*N (contradiction).
-            let new_rev = self
-                .prev_angle
-                .map(|prev| {
-                    spoke.angle < self.spokes_per_rev / 8
-                        && prev > self.spokes_per_rev * 7 / 8
-                })
-                .unwrap_or(false);
+            // Detect a new revolution using cumulative forward-angle progress.
+            //
+            // The angle field cycles 0 → spokes_per_rev-1 → 0.  Any backward
+            // step (new < prev) is either a genuine wrap or a Lagged-induced
+            // jump.  We cannot distinguish them by angle alone when the Pi's
+            // scheduler starves the spokes_stream task for >1.5 s, allowing
+            // the emulator to complete a full rotation while the receiver lags.
+            //
+            // Strategy: accumulate forward increments in angle_since_last_rev.
+            // On any backward step, fire a revolution only if ≥7/8 of a full
+            // revolution has been accumulated since the last fire — ensuring the
+            // tracker always receives a near-complete sweep regardless of how
+            // many Lagged events fired in between.  Reset the counter after
+            // every backward step (fire or not) so the next revolution starts
+            // fresh.
+            let new_rev = if let Some(prev) = self.prev_angle {
+                if spoke.angle > prev {
+                    self.angle_since_last_rev =
+                        self.angle_since_last_rev.saturating_add(spoke.angle - prev);
+                    false
+                } else {
+                    // Backward step — genuine wrap or Lagged.
+                    let fire =
+                        self.angle_since_last_rev >= self.spokes_per_rev * 7 / 8;
+                    self.angle_since_last_rev = 0;
+                    fire
+                }
+            } else {
+                false
+            };
             self.prev_angle = Some(spoke.angle);
 
             if new_rev {
