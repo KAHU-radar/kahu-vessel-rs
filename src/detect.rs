@@ -41,6 +41,11 @@ pub fn detect(
         return vec![];
     }
 
+    // DEBUG: confirm actual pixel intensity range from emulator/hardware.
+    // THRESHOLD assumes 4-bit values (0–15); remove once range is confirmed.
+    let max_px = data.iter().copied().max().unwrap_or(0);
+    log::debug!("spoke max pixel value: {}", max_px);
+
     let m_per_px = total_range_m as f32 / data.len() as f32;
     let bearing_rad =
         bearing_spoke as f32 * (2.0 * std::f32::consts::PI) / spokes_per_rev as f32;
